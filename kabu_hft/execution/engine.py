@@ -101,9 +101,26 @@ class PriceSelector:
             return min(snapshot.bid + self.tick_size, snapshot.ask - self.tick_size)
         return max(snapshot.ask - self.tick_size, snapshot.bid + self.tick_size)
 
-    def entry(self, *, direction: int, snapshot: BoardSnapshot, score: float, microprice: float) -> PriceDecision:
+    def entry(
+        self,
+        *,
+        direction: int,
+        snapshot: BoardSnapshot,
+        score: float,
+        microprice: float,
+        retreat_ticks: int = 0,
+    ) -> PriceDecision:
+        """
+        Compute entry price.
+
+        Parameters
+        ----------
+        retreat_ticks : Move entry price *away* from best by this many ticks.
+                        0 = normal passive (post at best bid/ask).
+                        1 = queue-defense mode (one tick behind best, avoid thin queues).
+        """
         if direction > 0:
-            price = snapshot.bid
+            price = snapshot.bid - retreat_ticks * self.tick_size
             if score >= self.strong_threshold and snapshot.spread >= 2 * self.tick_size:
                 price = self._improve_price(direction, snapshot)
             is_market = self.allow_aggressive_entry and score >= self.strong_threshold * 1.5
@@ -111,7 +128,7 @@ class PriceSelector:
                 price = snapshot.ask
             edge_ticks = (microprice - price) / max(self.tick_size, 1e-9)
         else:
-            price = snapshot.ask
+            price = snapshot.ask + retreat_ticks * self.tick_size
             if score >= self.strong_threshold and snapshot.spread >= 2 * self.tick_size:
                 price = self._improve_price(direction, snapshot)
             is_market = self.allow_aggressive_entry and score >= self.strong_threshold * 1.5
@@ -213,12 +230,21 @@ class ExecutionController:
             return 0
         return max(0, now_ns - self.working_order.sent_ts_ns)
 
-    def preview_entry(self, *, direction: int, snapshot: BoardSnapshot, score: float, microprice: float) -> PriceDecision:
+    def preview_entry(
+        self,
+        *,
+        direction: int,
+        snapshot: BoardSnapshot,
+        score: float,
+        microprice: float,
+        retreat_ticks: int = 0,
+    ) -> PriceDecision:
         return self.selector.entry(
             direction=direction,
             snapshot=snapshot,
             score=score,
             microprice=microprice,
+            retreat_ticks=retreat_ticks,
         )
 
     async def open(
@@ -230,15 +256,28 @@ class ExecutionController:
         score: float,
         microprice: float,
         reason: str,
+        retreat_ticks: int = 0,
+        reservation_price: float | None = None,
     ) -> bool:
         if self.state is not ExecutionState.FLAT or qty <= 0:
             return False
+
+        # Reservation-price edge guard: only open if fair value suggests edge.
+        # In NORMAL mode: long requires reservation > current ask;
+        #                 short requires reservation < current bid.
+        # Skip this guard in QUEUE / ABNORMAL modes (caller passes None).
+        if reservation_price is not None:
+            if direction > 0 and reservation_price < snapshot.ask:
+                return False
+            if direction < 0 and reservation_price > snapshot.bid:
+                return False
 
         decision = self.preview_entry(
             direction=direction,
             snapshot=snapshot,
             score=score,
             microprice=microprice,
+            retreat_ticks=retreat_ticks,
         )
         if not decision.is_market and decision.edge_ticks < self.selector.min_edge_ticks:
             return False

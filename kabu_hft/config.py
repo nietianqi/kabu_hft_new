@@ -58,6 +58,20 @@ DEFAULT_CONFIG: dict = {
         "allow_aggressive_entry": False,
         "allow_aggressive_exit": True,
         "max_mtm_loss": -10_000,
+        # Market-state detection
+        "queue_spread_ticks": 1.5,
+        "event_rate_high": 100.0,
+        "event_rate_freeze": 0.5,
+        # Queue-defense execution
+        "queue_qty_threshold": 200,
+        # Reservation pricer
+        "fair_value_beta": 0.5,
+        "base_half_spread_ticks": 0.5,
+        "inv_skew_medium_threshold": 0.3,
+        "inv_skew_heavy_threshold": 0.6,
+        "inv_skew_light": 0.5,
+        "inv_skew_medium": 1.0,
+        "inv_skew_heavy": 2.0,
         "signal_weights": {
             "lob_ofi": 0.30,
             "obi": 0.25,
@@ -191,6 +205,20 @@ class StrategyConfig:
     allow_aggressive_entry: bool
     allow_aggressive_exit: bool
     max_mtm_loss: float
+    # Market-state detection
+    queue_spread_ticks: float
+    event_rate_high: float
+    event_rate_freeze: float
+    # Queue-defense execution
+    queue_qty_threshold: int
+    # Reservation pricer
+    fair_value_beta: float
+    base_half_spread_ticks: float
+    inv_skew_medium_threshold: float
+    inv_skew_heavy_threshold: float
+    inv_skew_light: float
+    inv_skew_medium: float
+    inv_skew_heavy: float
     signal_weights: SignalWeights = field(default_factory=SignalWeights)
 
 
@@ -258,6 +286,17 @@ def load_config(path: str | Path | None) -> AppConfig:
                 allow_aggressive_entry=bool(merged.get("allow_aggressive_entry", False)),
                 allow_aggressive_exit=bool(merged.get("allow_aggressive_exit", True)),
                 max_mtm_loss=float(merged.get("max_mtm_loss", -10_000)),
+                queue_spread_ticks=float(merged.get("queue_spread_ticks", 1.5)),
+                event_rate_high=float(merged.get("event_rate_high", 100.0)),
+                event_rate_freeze=float(merged.get("event_rate_freeze", 0.5)),
+                queue_qty_threshold=int(merged.get("queue_qty_threshold", 200)),
+                fair_value_beta=float(merged.get("fair_value_beta", 0.5)),
+                base_half_spread_ticks=float(merged.get("base_half_spread_ticks", 0.5)),
+                inv_skew_medium_threshold=float(merged.get("inv_skew_medium_threshold", 0.3)),
+                inv_skew_heavy_threshold=float(merged.get("inv_skew_heavy_threshold", 0.6)),
+                inv_skew_light=float(merged.get("inv_skew_light", 0.5)),
+                inv_skew_medium=float(merged.get("inv_skew_medium", 1.0)),
+                inv_skew_heavy=float(merged.get("inv_skew_heavy", 2.0)),
                 signal_weights=SignalWeights.from_dict(merged.get("signal_weights")),
             )
         )

@@ -56,6 +56,9 @@ class SignalPacket:
     micro_momentum_z: float
     microprice_tilt_z: float
     composite: float
+    # Best-level queue sizes — used downstream by QueueDefense mode
+    queue_bid_qty: int = 0
+    queue_ask_qty: int = 0
 
 
 class OBISignal:
@@ -237,6 +240,8 @@ class SignalStack:
             micro_momentum_z=micro_momentum_z,
             microprice_tilt_z=microprice_tilt_z,
             composite=composite,
+            queue_bid_qty=snapshot.bid_size,
+            queue_ask_qty=snapshot.ask_size,
         )
         return self.last
 

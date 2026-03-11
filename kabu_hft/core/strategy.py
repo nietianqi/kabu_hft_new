@@ -6,11 +6,12 @@ import time
 from datetime import datetime
 
 from kabu_hft.config import OrderProfile, StrategyConfig
+from kabu_hft.core.pricer import ReservationPricer
 from kabu_hft.execution import ExecutionController, ExecutionState
 from kabu_hft.gateway import BoardSnapshot, KabuAdapter, KabuRestClient, TradePrint
 from kabu_hft.journal import TradeJournal
 from kabu_hft.risk import RiskGuard
-from kabu_hft.signals import SignalPacket, SignalStack
+from kabu_hft.signals import MarketState, MarketStateDetector, SignalPacket, SignalStack
 
 logger = logging.getLogger("kabu.strategy")
 
@@ -73,6 +74,30 @@ class HFTStrategy:
             allow_aggressive_entry=config.allow_aggressive_entry,
             allow_aggressive_exit=config.allow_aggressive_exit,
         )
+
+        # Market state detection
+        self.state_detector = MarketStateDetector(
+            queue_spread_ticks=config.queue_spread_ticks,
+            event_rate_high=config.event_rate_high,
+            event_rate_freeze=config.event_rate_freeze,
+            stale_quote_ms=config.stale_quote_ms,
+            tick_size=config.tick_size,
+        )
+
+        # Reservation pricer (fair value + 3-segment inventory skew)
+        self.pricer = ReservationPricer(
+            fair_value_beta=config.fair_value_beta,
+            base_half_spread_ticks=config.base_half_spread_ticks,
+            inv_skew_medium_threshold=config.inv_skew_medium_threshold,
+            inv_skew_heavy_threshold=config.inv_skew_heavy_threshold,
+            inv_skew_light=config.inv_skew_light,
+            inv_skew_medium=config.inv_skew_medium,
+            inv_skew_heavy=config.inv_skew_heavy,
+            tick_size=config.tick_size,
+            max_inventory_qty=config.max_inventory_qty,
+        )
+
+        self._market_state: MarketState = MarketState.NORMAL
 
         self.journal = journal
         self.markout_seconds = markout_seconds
@@ -160,11 +185,26 @@ class HFTStrategy:
 
     async def _process_signal(self, snapshot: BoardSnapshot, signal: SignalPacket, now_ns: int) -> None:
         self._drain_completed_trades()
-        state = self.execution.state
+        exec_state = self.execution.state
         now_dt = datetime.now()
-        score = signal.composite
 
-        if state is ExecutionState.OPENING:
+        # ── Step 1: Classify market state and apply gate ──────────────────────
+        self._market_state = self.state_detector.update(
+            snapshot, now_ns, now_dt, self.risk.session
+        )
+        gate = self.state_detector.state_gate()
+
+        # Apply state gate to composite: 1.0 NORMAL, 0.6 QUEUE, 0.0 ABNORMAL.
+        # Raw signal.composite (un-gated) is preserved for replay/markout analysis.
+        score = gate * signal.composite
+
+        # ── Step 2: Reservation price (fair_value with inventory skew) ─────────
+        inv = self.execution.inventory
+        fair = self.pricer.fair_value(snapshot.mid, signal.composite)
+        reservation = self.pricer.reservation(fair, inv.side, inv.qty)
+
+        # ── OPENING: check if we should cancel and requote ────────────────────
+        if exec_state is ExecutionState.OPENING:
             working = self.execution.working_order
             if working is None:
                 return
@@ -187,8 +227,25 @@ class HFTStrategy:
                 await self.execution.cancel_working(reason=reason)
             return
 
-        if state is ExecutionState.CLOSING:
-            inv = self.execution.inventory
+        # ── ABNORMAL state: force-close any open position ─────────────────────
+        if self._market_state is MarketState.ABNORMAL:
+            if exec_state is ExecutionState.OPEN and self.execution.working_order is None:
+                logger.warning(
+                    "abnormal_state_close symbol=%s event_rate=%.1f",
+                    self.config.symbol,
+                    self.state_detector.event_rate,
+                )
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason="abnormal_state",
+                    force=True,
+                )
+            # No new entries during ABNORMAL
+            return
+
+        # ── CLOSING: wait for fill; escalate if must_close ───────────────────
+        if exec_state is ExecutionState.CLOSING:
             must_close, reason = self.risk.must_close(
                 open_ts_ns=inv.opened_ts_ns,
                 snapshot=snapshot,
@@ -202,8 +259,8 @@ class HFTStrategy:
                 await self.execution.cancel_working(reason=reason)
             return
 
-        if state is ExecutionState.OPEN:
-            inv = self.execution.inventory
+        # ── OPEN: monitor for exit conditions ────────────────────────────────
+        if exec_state is ExecutionState.OPEN:
             must_close, reason = self.risk.must_close(
                 open_ts_ns=inv.opened_ts_ns,
                 snapshot=snapshot,
@@ -213,18 +270,32 @@ class HFTStrategy:
                 position_side=inv.side,
                 position_qty=inv.qty,
             )
+
+            # Signal-based reversal exit
             signal_reversed = (
-                self.execution.inventory.side > 0 and score <= -self.config.exit_threshold
+                inv.side > 0 and score <= -self.config.exit_threshold
             ) or (
-                self.execution.inventory.side < 0 and score >= self.config.exit_threshold
+                inv.side < 0 and score >= self.config.exit_threshold
             )
-            if must_close or signal_reversed:
+
+            # Enhanced: sign-flip since entry (alpha reversed direction)
+            alpha_flipped = (
+                self._signal_at_entry is not None
+                and self._signal_at_entry.composite * signal.composite < -0.05
+            )
+
+            if must_close or signal_reversed or alpha_flipped:
+                force = must_close or alpha_flipped or abs(score) >= self.config.strong_threshold
                 await self.execution.close(
                     snapshot=snapshot,
                     score=score,
-                    reason=reason or "signal_reverse",
-                    force=must_close or abs(score) >= self.config.strong_threshold,
+                    reason=reason or ("alpha_flip" if alpha_flipped else "signal_reverse"),
+                    force=force,
                 )
+            return
+
+        # ── FLAT: consider new entry ──────────────────────────────────────────
+        if abs(score) < self.config.entry_threshold:
             return
 
         direction = 1 if score > 0 else -1
@@ -247,13 +318,20 @@ class HFTStrategy:
         if qty <= 0:
             return
 
+        # Determine execution mode parameters
+        in_queue_mode = self._market_state is MarketState.QUEUE
+        retreat = 1 if in_queue_mode else 0
+
+        # In QUEUE mode we skip the reservation_price guard (no fundamental edge requirement)
+        # In NORMAL mode we pass reservation_price so ExecutionController can verify edge
+        res_price = None if in_queue_mode else reservation
+
         if self.shadow_live:
             logger.info(
-                "SHADOW_LIVE would_send_entry side=%+d qty=%d mid=%.2f composite=%.3f symbol=%s",
-                direction,
-                qty,
-                snapshot.mid,
-                score,
+                "SHADOW_LIVE would_send_entry side=%+d qty=%d mid=%.2f composite=%.3f "
+                "fair=%.2f reservation=%.2f state=%s retreat_ticks=%d symbol=%s",
+                direction, qty, snapshot.mid, score,
+                fair, reservation, self._market_state.value, retreat,
                 self.config.symbol,
             )
 
@@ -264,6 +342,8 @@ class HFTStrategy:
             score=abs(score),
             microprice=signal.microprice,
             reason="alpha_entry",
+            retreat_ticks=retreat,
+            reservation_price=res_price,
         )
         if opened:
             self._signal_at_entry = signal
@@ -345,6 +425,8 @@ class HFTStrategy:
         return {
             "symbol": self.config.symbol,
             "state": self.execution.state.value,
+            "market_state": self._market_state.value,
+            "event_rate": round(self.state_detector.event_rate, 1),
             "board_count": self.board_count,
             "trade_count": self.trade_count,
             "signal_count": self.signal_count,
