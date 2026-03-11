@@ -6,7 +6,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from kabu_hft.config import OrderProfile, StrategyConfig
-from kabu_hft.execution import ExecutionController, ExecutionState
+from kabu_hft.core.market_state import MarketState, MarketStateDetector
+from kabu_hft.execution import ExecutionController, ExecutionState, QuoteMode
 from kabu_hft.gateway import BoardSnapshot, KabuAdapter, KabuRestClient, TradePrint
 from kabu_hft.journal import TradeJournal
 from kabu_hft.risk import RiskGuard
@@ -71,12 +72,26 @@ class HFTStrategy:
             allow_aggressive_entry=config.allow_aggressive_entry,
             allow_aggressive_exit=config.allow_aggressive_exit,
         )
+        self.market_state = MarketStateDetector(
+            tick_size=config.tick_size,
+            stale_quote_ms=config.stale_quote_ms,
+            queue_spread_max_ticks=config.queue_spread_max_ticks,
+            abnormal_max_spread_ticks=config.abnormal_max_spread_ticks,
+            max_event_rate_hz=config.max_event_rate_hz,
+            state_window_ms=config.state_window_ms,
+            jump_threshold_ticks=config.jump_threshold_ticks,
+        )
 
         self.journal = journal
         self.markout_seconds = markout_seconds
         self._last_snapshot: BoardSnapshot | None = None
         self._signal_at_entry: SignalPacket | None = None
         self._mid_ref: list[float] = [0.0]
+        self._last_market_state: str = MarketState.NORMAL.value
+        self._last_market_reason: str = "init"
+        self._last_fair_price: float = 0.0
+        self._last_reservation_price: float = 0.0
+        self._pending_entry_alpha: float = 0.0
 
         self.started = False
         self.latest_item: tuple[BoardSnapshot, SignalPacket, int] | None = None
@@ -158,19 +173,45 @@ class HFTStrategy:
 
     async def _process_signal(self, snapshot: BoardSnapshot, signal: SignalPacket, now_ns: int) -> None:
         self._drain_completed_trades()
-        state = self.execution.state
         now_dt = datetime.now(JST)
         score = signal.composite
+        state = self.execution.state
+        market_view = self.market_state.evaluate(snapshot, now_ns)
+        self._last_market_state = market_view.state.value
+        self._last_market_reason = market_view.reason
+        fair_price, reservation_price = self._fair_and_reservation(snapshot, score)
+        self._last_fair_price = fair_price
+        self._last_reservation_price = reservation_price
+
+        if state is not ExecutionState.OPENING:
+            self._pending_entry_alpha = 0.0
+
+        if market_view.state is MarketState.ABNORMAL:
+            if state is ExecutionState.OPENING and self.execution.working_age_ns(now_ns) > self.execution.min_order_lifetime_ns:
+                await self.execution.cancel_working(reason=f"abnormal_{market_view.reason}")
+            elif state is ExecutionState.OPEN:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason=f"abnormal_{market_view.reason}",
+                    force=True,
+                )
+            return
 
         if state is ExecutionState.OPENING:
             working = self.execution.working_order
             if working is None:
                 return
+            queue_threshold = self._queue_threshold(snapshot, abs(score))
+            mode = self._parse_mode(working.mode)
             desired = self.execution.preview_entry(
                 direction=working.side,
                 snapshot=snapshot,
                 score=abs(score),
                 microprice=signal.microprice,
+                mode=mode,
+                reservation_price=reservation_price,
+                queue_qty_threshold=queue_threshold,
             )
             should_cancel, reason = self.risk.should_cancel_entry(
                 working_price=working.price,
@@ -181,6 +222,13 @@ class HFTStrategy:
                 snapshot=snapshot,
                 now_ns=now_ns,
             )
+            if self._pending_entry_alpha != 0.0 and score * self._pending_entry_alpha < 0 and abs(score) >= self.config.exit_threshold:
+                should_cancel = True
+                reason = "alpha_flip"
+            fair_drift_ticks = abs(fair_price - working.price) / max(self.config.tick_size, 1e-9)
+            if fair_drift_ticks >= self.config.max_fair_drift_ticks:
+                should_cancel = True
+                reason = "fair_drift"
             if should_cancel and self.execution.can_requote(now_ns):
                 await self.execution.cancel_working(reason=reason)
             return
@@ -217,6 +265,8 @@ class HFTStrategy:
                 )
             return
 
+        if score == 0.0:
+            return
         direction = 1 if score > 0 else -1
         allowed, reason = self.risk.can_open(
             snapshot=snapshot,
@@ -237,6 +287,8 @@ class HFTStrategy:
         if qty <= 0:
             return
 
+        quote_mode = self._mode_for_market(market_view.state)
+        queue_threshold = self._queue_threshold(snapshot, abs(score))
         opened = await self.execution.open(
             direction=direction,
             qty=qty,
@@ -244,9 +296,59 @@ class HFTStrategy:
             score=abs(score),
             microprice=signal.microprice,
             reason="alpha_entry",
+            mode=quote_mode,
+            reservation_price=reservation_price,
+            queue_qty_threshold=queue_threshold,
         )
         if opened:
             self._signal_at_entry = signal
+            self._pending_entry_alpha = score
+
+    def _fair_and_reservation(self, snapshot: BoardSnapshot, score: float) -> tuple[float, float]:
+        tick = max(self.config.tick_size, 1e-9)
+        fair_shift_ticks = max(
+            -self.config.max_fair_shift_ticks,
+            min(self.config.max_fair_shift_ticks, self.config.fair_value_beta * score),
+        )
+        fair_price = snapshot.mid + fair_shift_ticks * tick
+
+        inventory_ratio = 0.0
+        if self.config.max_inventory_qty > 0:
+            signed_inventory = self.execution.inventory.side * self.execution.inventory.qty
+            inventory_ratio = signed_inventory / self.config.max_inventory_qty
+        skew_multiplier = 1.0
+        if abs(inventory_ratio) >= 0.66:
+            skew_multiplier = 1.5
+        skew_ticks = self.config.inventory_skew_ticks * skew_multiplier * inventory_ratio
+        reservation_price = fair_price - skew_ticks * tick
+        return fair_price, reservation_price
+
+    def _mode_for_market(self, market_state: MarketState) -> QuoteMode:
+        if market_state is MarketState.QUEUE:
+            return QuoteMode.QUEUE_DEFENSE
+        if market_state is MarketState.ABNORMAL:
+            return QuoteMode.CLOSE_ONLY
+        return QuoteMode.PASSIVE_FAIR_VALUE
+
+    def _queue_threshold(self, snapshot: BoardSnapshot, signal_strength: float) -> int:
+        base = max(self.config.queue_min_top_qty, 1)
+        inventory_ratio = 0.0
+        if self.config.max_inventory_qty > 0:
+            inventory_ratio = min(
+                1.0,
+                self.execution.inventory.qty / self.config.max_inventory_qty,
+            )
+        spread_factor = 1.0 if snapshot.spread <= self.config.tick_size + 1e-9 else 0.8
+        alpha_factor = 1.0 + max(signal_strength - 1.0, 0.0) * 0.25
+        threshold = int(base * spread_factor * alpha_factor * (1.0 + inventory_ratio))
+        return max(threshold, 1)
+
+    @staticmethod
+    def _parse_mode(raw: str) -> QuoteMode:
+        try:
+            return QuoteMode(raw)
+        except ValueError:
+            return QuoteMode.PASSIVE_FAIR_VALUE
 
     async def emergency_close(self) -> None:
         """Attempt a forced market close of any open inventory. Called during shutdown."""
@@ -325,6 +427,8 @@ class HFTStrategy:
         return {
             "symbol": self.config.symbol,
             "state": self.execution.state.value,
+            "market_state": self._last_market_state,
+            "market_reason": self._last_market_reason,
             "board_count": self.board_count,
             "trade_count": self.trade_count,
             "signal_count": self.signal_count,
@@ -335,5 +439,7 @@ class HFTStrategy:
                 "obi_z": signal.obi_z if signal else 0.0,
                 "lob_ofi_z": signal.lob_ofi_z if signal else 0.0,
                 "tape_ofi_z": signal.tape_ofi_z if signal else 0.0,
+                "fair_price": self._last_fair_price,
+                "reservation_price": self._last_reservation_price,
             },
         }

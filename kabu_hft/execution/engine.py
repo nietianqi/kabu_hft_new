@@ -19,6 +19,12 @@ class ExecutionState(str, Enum):
     CLOSING = "CLOSING"
 
 
+class QuoteMode(str, Enum):
+    PASSIVE_FAIR_VALUE = "PASSIVE_FAIR_VALUE"
+    QUEUE_DEFENSE = "QUEUE_DEFENSE"
+    CLOSE_ONLY = "CLOSE_ONLY"
+
+
 @dataclass(slots=True)
 class PriceDecision:
     price: float
@@ -36,6 +42,7 @@ class WorkingOrder:
     is_market: bool
     sent_ts_ns: int
     reason: str
+    mode: str = QuoteMode.PASSIVE_FAIR_VALUE.value
     cum_qty: int = 0
     avg_fill_price: float = 0.0
     cancel_requested: bool = False
@@ -96,28 +103,68 @@ class PriceSelector:
         self.allow_aggressive_entry = allow_aggressive_entry
         self.allow_aggressive_exit = allow_aggressive_exit
 
+    def _retreat_price(self, direction: int, snapshot: BoardSnapshot) -> float:
+        if direction > 0:
+            return max(snapshot.bid - self.tick_size, self.tick_size)
+        return max(snapshot.ask + self.tick_size, self.tick_size)
+
     def _improve_price(self, direction: int, snapshot: BoardSnapshot) -> float:
         if direction > 0:
             return min(snapshot.bid + self.tick_size, snapshot.ask - self.tick_size)
         return max(snapshot.ask - self.tick_size, snapshot.bid + self.tick_size)
 
-    def entry(self, *, direction: int, snapshot: BoardSnapshot, score: float, microprice: float) -> PriceDecision:
+    def entry(
+        self,
+        *,
+        direction: int,
+        snapshot: BoardSnapshot,
+        score: float,
+        microprice: float,
+        mode: QuoteMode,
+        reservation_price: float | None,
+        queue_qty_threshold: int,
+    ) -> PriceDecision:
+        reference_price = reservation_price if reservation_price and reservation_price > 0 else microprice
         if direction > 0:
             price = snapshot.bid
-            if score >= self.strong_threshold and snapshot.spread >= 2 * self.tick_size:
+            if mode is QuoteMode.QUEUE_DEFENSE and snapshot.bid_size < max(queue_qty_threshold, 1):
+                price = self._retreat_price(direction, snapshot)
+            elif (
+                mode is QuoteMode.PASSIVE_FAIR_VALUE
+                and reservation_price is not None
+                and reservation_price <= snapshot.bid - self.tick_size
+            ):
+                price = self._retreat_price(direction, snapshot)
+            elif score >= self.strong_threshold and snapshot.spread >= 2 * self.tick_size:
                 price = self._improve_price(direction, snapshot)
-            is_market = self.allow_aggressive_entry and score >= self.strong_threshold * 1.5
+            is_market = (
+                self.allow_aggressive_entry
+                and mode is not QuoteMode.CLOSE_ONLY
+                and score >= self.strong_threshold * 1.5
+            )
             if is_market:
                 price = snapshot.ask
-            edge_ticks = (microprice - price) / max(self.tick_size, 1e-9)
+            edge_ticks = (reference_price - price) / max(self.tick_size, 1e-9)
         else:
             price = snapshot.ask
-            if score >= self.strong_threshold and snapshot.spread >= 2 * self.tick_size:
+            if mode is QuoteMode.QUEUE_DEFENSE and snapshot.ask_size < max(queue_qty_threshold, 1):
+                price = self._retreat_price(direction, snapshot)
+            elif (
+                mode is QuoteMode.PASSIVE_FAIR_VALUE
+                and reservation_price is not None
+                and reservation_price >= snapshot.ask + self.tick_size
+            ):
+                price = self._retreat_price(direction, snapshot)
+            elif score >= self.strong_threshold and snapshot.spread >= 2 * self.tick_size:
                 price = self._improve_price(direction, snapshot)
-            is_market = self.allow_aggressive_entry and score >= self.strong_threshold * 1.5
+            is_market = (
+                self.allow_aggressive_entry
+                and mode is not QuoteMode.CLOSE_ONLY
+                and score >= self.strong_threshold * 1.5
+            )
             if is_market:
                 price = snapshot.bid
-            edge_ticks = (price - microprice) / max(self.tick_size, 1e-9)
+            edge_ticks = (price - reference_price) / max(self.tick_size, 1e-9)
         return PriceDecision(price=price, is_market=is_market, edge_ticks=edge_ticks)
 
     def exit(
@@ -213,12 +260,25 @@ class ExecutionController:
             return 0
         return max(0, now_ns - self.working_order.sent_ts_ns)
 
-    def preview_entry(self, *, direction: int, snapshot: BoardSnapshot, score: float, microprice: float) -> PriceDecision:
+    def preview_entry(
+        self,
+        *,
+        direction: int,
+        snapshot: BoardSnapshot,
+        score: float,
+        microprice: float,
+        mode: QuoteMode = QuoteMode.PASSIVE_FAIR_VALUE,
+        reservation_price: float | None = None,
+        queue_qty_threshold: int = 0,
+    ) -> PriceDecision:
         return self.selector.entry(
             direction=direction,
             snapshot=snapshot,
             score=score,
             microprice=microprice,
+            mode=mode,
+            reservation_price=reservation_price,
+            queue_qty_threshold=queue_qty_threshold,
         )
 
     async def open(
@@ -230,6 +290,9 @@ class ExecutionController:
         score: float,
         microprice: float,
         reason: str,
+        mode: QuoteMode = QuoteMode.PASSIVE_FAIR_VALUE,
+        reservation_price: float | None = None,
+        queue_qty_threshold: int = 0,
     ) -> bool:
         if self.state is not ExecutionState.FLAT or qty <= 0:
             return False
@@ -239,6 +302,9 @@ class ExecutionController:
             snapshot=snapshot,
             score=score,
             microprice=microprice,
+            mode=mode,
+            reservation_price=reservation_price,
+            queue_qty_threshold=queue_qty_threshold,
         )
         if not decision.is_market and decision.edge_ticks < self.selector.min_edge_ticks:
             return False
@@ -271,15 +337,17 @@ class ExecutionController:
             is_market=decision.is_market,
             sent_ts_ns=now_ns,
             reason=reason,
+            mode=mode.value,
         )
         self.stats["sent_orders"] += 1
         logger.info(
-            "entry order sent symbol=%s side=%+d qty=%d price=%.3f market=%s dry_run=%s",
+            "entry order sent symbol=%s side=%+d qty=%d price=%.3f market=%s mode=%s dry_run=%s",
             self.symbol,
             direction,
             qty,
             decision.price,
             decision.is_market,
+            mode.value,
             self.dry_run,
         )
 
@@ -434,6 +502,7 @@ class ExecutionController:
             "working_order_id": self.current_order_id,
             "working_order_side": self.working_order.side if self.working_order else 0,
             "working_order_price": self.working_order.price if self.working_order else 0.0,
+            "working_order_mode": self.working_order.mode if self.working_order else "",
             "stats": dict(self.stats),
         }
 

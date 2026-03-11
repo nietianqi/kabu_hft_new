@@ -30,6 +30,12 @@ kabu_hft/
   signals/microstructure.py
 ```
 
+## Adaptive execution modes
+
+- `NORMAL`: passive fair-value quoting (reservation price around microstructure alpha).
+- `QUEUE`: queue-defense mode for one-tick spread regimes (retreat when top queue is thin).
+- `ABNORMAL`: close-only behavior (no new entries, prioritize risk reduction).
+
 ## Quick start
 
 ```bash
@@ -59,6 +65,7 @@ Use module-style execution from repository root:
 python -m unittest tests.test_gateway -v
 python -m unittest tests.test_signals -v
 python -m unittest tests.test_execution -v
+python -m unittest tests.test_market_regime -v
 python -m unittest tests.test_risk -v
 python -m unittest tests.test_replay -v
 python -m unittest tests.test_journal -v

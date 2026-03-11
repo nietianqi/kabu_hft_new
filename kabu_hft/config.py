@@ -37,6 +37,10 @@ DEFAULT_CONFIG: dict = {
         "entry_threshold": 0.40,
         "exit_threshold": 0.15,
         "strong_threshold": 0.75,
+        "fair_value_beta": 0.75,
+        "max_fair_shift_ticks": 3.0,
+        "inventory_skew_ticks": 1.0,
+        "max_fair_drift_ticks": 1.5,
         "obi_depth": 5,
         "obi_decay": 0.70,
         "lob_ofi_depth": 5,
@@ -54,6 +58,12 @@ DEFAULT_CONFIG: dict = {
         "stale_quote_ms": 1200,
         "poll_interval_ms": 350,
         "min_board_interval_ms": 8.0,
+        "queue_spread_max_ticks": 1.0,
+        "queue_min_top_qty": 300,
+        "abnormal_max_spread_ticks": 6.0,
+        "max_event_rate_hz": 120.0,
+        "state_window_ms": 3000,
+        "jump_threshold_ticks": 4.0,
         "max_requotes_per_minute": 30,
         "allow_aggressive_entry": False,
         "allow_aggressive_exit": True,
@@ -169,6 +179,10 @@ class StrategyConfig:
     entry_threshold: float
     exit_threshold: float
     strong_threshold: float
+    fair_value_beta: float
+    max_fair_shift_ticks: float
+    inventory_skew_ticks: float
+    max_fair_drift_ticks: float
     obi_depth: int
     obi_decay: float
     lob_ofi_depth: int
@@ -186,6 +200,12 @@ class StrategyConfig:
     stale_quote_ms: int
     poll_interval_ms: int
     min_board_interval_ms: float
+    queue_spread_max_ticks: float
+    queue_min_top_qty: int
+    abnormal_max_spread_ticks: float
+    max_event_rate_hz: float
+    state_window_ms: int
+    jump_threshold_ticks: float
     max_requotes_per_minute: int
     allow_aggressive_entry: bool
     allow_aggressive_exit: bool
@@ -235,6 +255,10 @@ def load_config(path: str | Path | None) -> AppConfig:
                 entry_threshold=float(merged.get("entry_threshold", 0.40)),
                 exit_threshold=float(merged.get("exit_threshold", 0.15)),
                 strong_threshold=float(merged.get("strong_threshold", 0.75)),
+                fair_value_beta=float(merged.get("fair_value_beta", 0.75)),
+                max_fair_shift_ticks=float(merged.get("max_fair_shift_ticks", 3.0)),
+                inventory_skew_ticks=float(merged.get("inventory_skew_ticks", 1.0)),
+                max_fair_drift_ticks=float(merged.get("max_fair_drift_ticks", 1.5)),
                 obi_depth=int(merged.get("obi_depth", 5)),
                 obi_decay=float(merged.get("obi_decay", 0.70)),
                 lob_ofi_depth=int(merged.get("lob_ofi_depth", 5)),
@@ -252,6 +276,12 @@ def load_config(path: str | Path | None) -> AppConfig:
                 stale_quote_ms=int(merged.get("stale_quote_ms", 1200)),
                 poll_interval_ms=int(merged.get("poll_interval_ms", 350)),
                 min_board_interval_ms=float(merged.get("min_board_interval_ms", 8.0)),
+                queue_spread_max_ticks=float(merged.get("queue_spread_max_ticks", 1.0)),
+                queue_min_top_qty=int(merged.get("queue_min_top_qty", 300)),
+                abnormal_max_spread_ticks=float(merged.get("abnormal_max_spread_ticks", 6.0)),
+                max_event_rate_hz=float(merged.get("max_event_rate_hz", 120.0)),
+                state_window_ms=int(merged.get("state_window_ms", 3000)),
+                jump_threshold_ticks=float(merged.get("jump_threshold_ticks", 4.0)),
                 max_requotes_per_minute=int(merged.get("max_requotes_per_minute", 30)),
                 allow_aggressive_entry=bool(merged.get("allow_aggressive_entry", False)),
                 allow_aggressive_exit=bool(merged.get("allow_aggressive_exit", True)),

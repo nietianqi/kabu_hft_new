@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from kabu_hft.config import OrderProfile
-from kabu_hft.execution import ExecutionController, ExecutionState
+from kabu_hft.execution import ExecutionController, ExecutionState, QuoteMode
 from kabu_hft.gateway import BoardSnapshot, KabuRestClient, Level, TradePrint
 
 
@@ -89,6 +89,50 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(controller.state, ExecutionState.FLAT)
         self.assertEqual(len(controller.drain_round_trips()), 1)
+
+    async def test_queue_defense_retreats_when_top_queue_is_thin(self) -> None:
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=1,
+            rest_client=DummyRestClient(),
+            order_profile=OrderProfile(),
+            dry_run=True,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.0,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+        )
+        snapshot = BoardSnapshot(
+            symbol="9984",
+            exchange=1,
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=50,
+            ask_size=700,
+            last=100.5,
+            last_size=0,
+            volume=1_000,
+            vwap=100.5,
+            bids=(Level(100.0, 50),),
+            asks=(Level(101.0, 700),),
+            prev_board=None,
+        )
+
+        decision = controller.preview_entry(
+            direction=1,
+            snapshot=snapshot,
+            score=0.7,
+            microprice=100.6,
+            mode=QuoteMode.QUEUE_DEFENSE,
+            reservation_price=100.5,
+            queue_qty_threshold=100,
+        )
+        self.assertEqual(decision.price, 99.0)
 
 
 if __name__ == "__main__":
