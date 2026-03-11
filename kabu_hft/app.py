@@ -10,6 +10,7 @@ from kabu_hft.config import AppConfig, load_config
 from kabu_hft.core import HFTStrategy
 from kabu_hft.gateway import BoardSnapshot, KabuRestClient, KabuWebSocket, TradePrint
 from kabu_hft.journal import TradeJournal
+from kabu_hft.replay.recorder import BoardRecorder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +28,9 @@ class KabuHFTApp:
         self.websocket: KabuWebSocket | None = None
         self.strategies: dict[str, HFTStrategy] = {}
         self.journal: TradeJournal | None = None
+        self.recorder: BoardRecorder | None = (
+            BoardRecorder(config.recording_path) if config.recording_path else None
+        )
         self.running = False
         self.status_task: asyncio.Task | None = None
 
@@ -50,6 +54,7 @@ class KabuHFTApp:
                 order_profile=self.config.order_profile,
                 rest_client=self.rest,
                 dry_run=self.config.dry_run,
+                shadow_live=self.config.shadow_live,
                 journal=self.journal,
                 markout_seconds=self.config.markout_seconds,
             )
@@ -64,6 +69,7 @@ class KabuHFTApp:
             on_board=self._on_board,
             on_trade=self._on_trade,
             on_reconnect=self._reregister_symbols,
+            on_raw=self.recorder.on_board if self.recorder is not None else None,
         )
         self.running = True
         self.status_task = asyncio.create_task(self._status_loop(), name="status-loop")
@@ -92,6 +98,9 @@ class KabuHFTApp:
 
         if self.journal is not None:
             self.journal.close()
+
+        if self.recorder is not None:
+            self.recorder.close()
 
     def _on_board(self, snapshot: BoardSnapshot) -> None:
         strategy = self.strategies.get(snapshot.symbol)

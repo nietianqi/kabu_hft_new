@@ -23,12 +23,14 @@ class HFTStrategy:
         order_profile: OrderProfile,
         rest_client: KabuRestClient,
         dry_run: bool,
+        shadow_live: bool = False,
         journal: TradeJournal | None = None,
         markout_seconds: int = 30,
     ):
         self.config = config
         self.rest_client = rest_client
         self.dry_run = dry_run
+        self.shadow_live = shadow_live
         self.signals = SignalStack(
             obi_depth=config.obi_depth,
             obi_decay=config.obi_decay,
@@ -54,6 +56,7 @@ class HFTStrategy:
             tick_size=config.tick_size,
             allow_short=order_profile.allow_short,
             entry_threshold=config.entry_threshold,
+            max_mtm_loss=config.max_mtm_loss,
         )
         self.execution = ExecutionController(
             symbol=config.symbol,
@@ -185,22 +188,30 @@ class HFTStrategy:
             return
 
         if state is ExecutionState.CLOSING:
+            inv = self.execution.inventory
             must_close, reason = self.risk.must_close(
-                open_ts_ns=self.execution.inventory.opened_ts_ns,
+                open_ts_ns=inv.opened_ts_ns,
                 snapshot=snapshot,
                 now_ns=now_ns,
                 now_dt=now_dt,
+                open_price=inv.avg_price,
+                position_side=inv.side,
+                position_qty=inv.qty,
             )
             if must_close and self.execution.working_age_ns(now_ns) > self.execution.min_order_lifetime_ns:
                 await self.execution.cancel_working(reason=reason)
             return
 
         if state is ExecutionState.OPEN:
+            inv = self.execution.inventory
             must_close, reason = self.risk.must_close(
-                open_ts_ns=self.execution.inventory.opened_ts_ns,
+                open_ts_ns=inv.opened_ts_ns,
                 snapshot=snapshot,
                 now_ns=now_ns,
                 now_dt=now_dt,
+                open_price=inv.avg_price,
+                position_side=inv.side,
+                position_qty=inv.qty,
             )
             signal_reversed = (
                 self.execution.inventory.side > 0 and score <= -self.config.exit_threshold
@@ -235,6 +246,16 @@ class HFTStrategy:
         )
         if qty <= 0:
             return
+
+        if self.shadow_live:
+            logger.info(
+                "SHADOW_LIVE would_send_entry side=%+d qty=%d mid=%.2f composite=%.3f symbol=%s",
+                direction,
+                qty,
+                snapshot.mid,
+                score,
+                self.config.symbol,
+            )
 
         opened = await self.execution.open(
             direction=direction,

@@ -571,11 +571,13 @@ class KabuWebSocket:
         on_board: Callable[[BoardSnapshot], None],
         on_trade: Callable[[TradePrint], None] | None = None,
         on_reconnect: Callable[[], Awaitable[None]] | None = None,
+        on_raw: Callable[[str, dict[str, Any], int], None] | None = None,
     ):
         self._url = url
         self._on_board = on_board
         self._on_trade = on_trade
         self._on_reconnect = on_reconnect
+        self._on_raw = on_raw
         self._running = False
         self._ws: websockets.ClientConnection | None = None
         self._snapshots: dict[str, BoardSnapshot] = {}
@@ -626,6 +628,14 @@ class KabuWebSocket:
             return
 
         symbol = str(data.get("Symbol", ""))
+
+        # Notify raw callback BEFORE normalization so recorder captures kabu field names.
+        if self._on_raw is not None:
+            try:
+                self._on_raw(symbol, data, recv_ns)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("on_raw callback error for %s: %s", symbol, exc)
+
         prev_snapshot = self._snapshots.get(symbol)
         snapshot = KabuAdapter.board(data, prev_snapshot)
         if snapshot is None:

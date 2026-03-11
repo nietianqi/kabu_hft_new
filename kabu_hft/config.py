@@ -15,6 +15,9 @@ DEFAULT_CONFIG: dict = {
     "journal_path": "trades.csv",
     "markout_seconds": 30,
     "rate_limit_per_second": 4.0,
+    "recording_path": "",
+    "shadow_live": False,
+    "replay_latency_us": 5000,
     "order_profile": {
         "mode": "cash",
         "allow_short": False,
@@ -54,6 +57,7 @@ DEFAULT_CONFIG: dict = {
         "max_requotes_per_minute": 30,
         "allow_aggressive_entry": False,
         "allow_aggressive_exit": True,
+        "max_mtm_loss": -10_000,
         "signal_weights": {
             "lob_ofi": 0.30,
             "obi": 0.25,
@@ -186,6 +190,7 @@ class StrategyConfig:
     max_requotes_per_minute: int
     allow_aggressive_entry: bool
     allow_aggressive_exit: bool
+    max_mtm_loss: float
     signal_weights: SignalWeights = field(default_factory=SignalWeights)
 
 
@@ -199,6 +204,9 @@ class AppConfig:
     journal_path: str
     markout_seconds: int
     rate_limit_per_second: float
+    recording_path: str
+    shadow_live: bool
+    replay_latency_us: int
     order_profile: OrderProfile
     strategies: list[StrategyConfig]
 
@@ -249,6 +257,7 @@ def load_config(path: str | Path | None) -> AppConfig:
                 max_requotes_per_minute=int(merged.get("max_requotes_per_minute", 30)),
                 allow_aggressive_entry=bool(merged.get("allow_aggressive_entry", False)),
                 allow_aggressive_exit=bool(merged.get("allow_aggressive_exit", True)),
+                max_mtm_loss=float(merged.get("max_mtm_loss", -10_000)),
                 signal_weights=SignalWeights.from_dict(merged.get("signal_weights")),
             )
         )
@@ -265,6 +274,9 @@ def load_config(path: str | Path | None) -> AppConfig:
         journal_path=str(payload.get("journal_path", "trades.csv")),
         markout_seconds=int(payload.get("markout_seconds", 30)),
         rate_limit_per_second=float(payload.get("rate_limit_per_second", 4.0)),
+        recording_path=str(payload.get("recording_path", "")),
+        shadow_live=bool(payload.get("shadow_live", False)),
+        replay_latency_us=int(payload.get("replay_latency_us", 5000)),
         order_profile=order_profile,
         strategies=strategies,
     )

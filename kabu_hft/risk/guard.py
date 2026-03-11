@@ -181,6 +181,7 @@ class RiskGuard:
         tick_size: float,
         allow_short: bool,
         entry_threshold: float,
+        max_mtm_loss: float = -10_000,
     ):
         self.session = SessionGuard()
         self.pnl = PnLTracker(daily_loss_limit, consecutive_loss_limit, cooling_seconds, max_hold_seconds)
@@ -191,6 +192,7 @@ class RiskGuard:
         self.tick_size = tick_size
         self.allow_short = allow_short
         self.entry_threshold = entry_threshold
+        self.max_mtm_loss = float(max_mtm_loss)
 
     def update_vol(self, snapshot: BoardSnapshot) -> float:
         return self.vol.update(snapshot.mid, snapshot.spread)
@@ -235,6 +237,17 @@ class RiskGuard:
             return False, "alpha_too_small"
         return True, "ok"
 
+    def unrealized_pnl(
+        self,
+        *,
+        open_price: float,
+        current_mid: float,
+        side: int,
+        qty: int,
+    ) -> float:
+        """Mark-to-market P&L of an open position (gross, no commission)."""
+        return side * (current_mid - open_price) * qty
+
     def must_close(
         self,
         *,
@@ -242,6 +255,9 @@ class RiskGuard:
         snapshot: BoardSnapshot,
         now_ns: int,
         now_dt: datetime,
+        open_price: float = 0.0,
+        position_side: int = 0,
+        position_qty: int = 0,
     ) -> tuple[bool, str]:
         if self.pnl.should_force_close(open_ts_ns, now_ns):
             return True, "max_hold_time"
@@ -251,6 +267,15 @@ class RiskGuard:
             return True, "invalid_quote"
         if now_ns - snapshot.ts_ns > self.stale_quote_ns:
             return True, "stale_quote"
+        if open_price > 0 and position_qty > 0 and position_side != 0:
+            mtm = self.unrealized_pnl(
+                open_price=open_price,
+                current_mid=snapshot.mid,
+                side=position_side,
+                qty=position_qty,
+            )
+            if mtm <= self.max_mtm_loss:
+                return True, "mtm_loss_limit"
         return False, ""
 
     def should_cancel_entry(
