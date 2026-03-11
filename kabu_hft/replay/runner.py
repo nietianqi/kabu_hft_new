@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from kabu_hft.clock import SimulatedClock
 from kabu_hft.config import OrderProfile, SignalWeights
 from kabu_hft.execution import ExecutionController, ExecutionState
-from kabu_hft.gateway import BoardSnapshot, KabuAdapter, KabuRestClient
+from kabu_hft.gateway import BoardSnapshot, KabuAdapter
 from kabu_hft.replay.loader import JsonlReplayLoader
 from kabu_hft.replay.metrics import ReplayMetrics, ReplaySummary
 from kabu_hft.signals import SignalStack
@@ -21,11 +22,14 @@ class ReplayConfig:
     exit_threshold: float = 0.2
     max_hold_events: int = 50
     strong_threshold: float = 1.2
+    queue_model: bool = True  # If True, simulate queue position before paper fills
+    order_latency_events: int = 0  # Number of board events to delay before paper order is acknowledged
 
 
 class ReplayRunner:
     def __init__(self, config: ReplayConfig):
         self.config = config
+        self._clock = SimulatedClock()
         self.signal_stack = SignalStack(
             obi_depth=5,
             obi_decay=0.7,
@@ -40,7 +44,7 @@ class ReplayRunner:
         self.execution = ExecutionController(
             symbol=config.symbol,
             exchange=config.exchange,
-            rest_client=KabuRestClient("http://localhost:18080"),
+            rest_client=None,
             order_profile=OrderProfile(),
             dry_run=True,
             tick_size=config.tick_size,
@@ -51,9 +55,12 @@ class ReplayRunner:
             max_requotes_per_minute=120,
             allow_aggressive_entry=True,
             allow_aggressive_exit=True,
+            clock=self._clock,
+            queue_model=config.queue_model,
         )
         self.metrics = ReplayMetrics(config.symbol)
         self._entry_event_index = -1
+        self._pending_ack_index = -1  # event_index at which paper order becomes active
 
     async def run(self, loader: JsonlReplayLoader) -> ReplaySummary:
         prev_snapshot: BoardSnapshot | None = None
@@ -70,7 +77,18 @@ class ReplayRunner:
             if snapshot is None:
                 continue
 
-            self.execution.sync_paper_board(snapshot)
+            # Advance simulated clock to the exchange timestamp of this event.
+            if snapshot.ts_ns > 0:
+                self._clock.set(snapshot.ts_ns)
+
+            # Only attempt paper fills if the simulated order latency has elapsed.
+            order_active = (
+                self.config.order_latency_events <= 0
+                or self._pending_ack_index < 0
+                or event_index >= self._pending_ack_index
+            )
+            if order_active:
+                self.execution.sync_paper_board(snapshot)
             trade = KabuAdapter.trade(
                 raw,
                 prev_snapshot,
@@ -79,7 +97,8 @@ class ReplayRunner:
             )
             if trade is not None:
                 self.signal_stack.on_trade(trade)
-                self.execution.sync_paper_trade(trade)
+                if order_active:
+                    self.execution.sync_paper_trade(trade)
                 last_trade_price = trade.price
             prev_volume = snapshot.volume
 
@@ -99,6 +118,7 @@ class ReplayRunner:
                 )
                 if opened:
                     self._entry_event_index = event_index
+                    self._pending_ack_index = event_index + self.config.order_latency_events
                     self.metrics.on_entry()
 
             elif self.execution.state == ExecutionState.OPEN:
@@ -124,6 +144,7 @@ class ReplayRunner:
             for trade_done in self.execution.drain_round_trips():
                 self.metrics.on_round_trip(trade_done)
                 self._entry_event_index = -1
+                self._pending_ack_index = -1
 
             prev_snapshot = snapshot
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from kabu_hft.adapter import NormalizedBook
+from kabu_hft.gateway import BoardSnapshot
 
 
 @dataclass(slots=True)
@@ -18,13 +18,13 @@ class MarketDataHealth:
 
 class BookState:
     def __init__(self) -> None:
-        self.latest: NormalizedBook | None = None
-        self.previous: NormalizedBook | None = None
+        self.latest: BoardSnapshot | None = None
+        self.previous: BoardSnapshot | None = None
         self.duplicate_count = 0
         self.out_of_order_count = 0
         self.last_update_ns = 0
 
-    def update(self, snapshot: NormalizedBook) -> bool:
+    def update(self, snapshot: BoardSnapshot) -> bool:
         if snapshot.out_of_order:
             self.out_of_order_count += 1
             return False

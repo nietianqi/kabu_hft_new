@@ -94,6 +94,8 @@ class BoardSnapshot:
     bids: tuple[Level, ...] = field(default_factory=tuple)
     asks: tuple[Level, ...] = field(default_factory=tuple)
     prev_board: Optional["BoardSnapshot"] = field(default=None, repr=False)
+    duplicate: bool = False
+    out_of_order: bool = False
 
     @property
     def mid(self) -> float:
@@ -131,6 +133,7 @@ class OrderSnapshot:
     state_code: int
     order_state_code: int
     is_final: bool
+    fill_ts_ns: int = 0  # Exchange fill timestamp; 0 if not available
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @property
@@ -180,30 +183,53 @@ class KabuAdapter:
         bids = cls._parse_levels(raw, "Buy", descending=True)
         asks = cls._parse_levels(raw, "Sell", descending=False)
 
-        bid = _parse_float(raw.get("AskPrice")) or (bids[0].price if bids else 0.0)
-        ask = _parse_float(raw.get("BidPrice")) or (asks[0].price if asks else 0.0)
-        bid_size = _parse_int(raw.get("AskQty")) or (bids[0].size if bids else 0)
-        ask_size = _parse_int(raw.get("BidQty")) or (asks[0].size if asks else 0)
+        _bid_raw = _parse_float(raw.get("AskPrice"))
+        bid = _bid_raw if _bid_raw > 0 else (bids[0].price if bids else 0.0)
+        _ask_raw = _parse_float(raw.get("BidPrice"))
+        ask = _ask_raw if _ask_raw > 0 else (asks[0].price if asks else 0.0)
+        _bid_sz_raw = _parse_int(raw.get("AskQty"))
+        bid_size = _bid_sz_raw if _bid_sz_raw > 0 else (bids[0].size if bids else 0)
+        _ask_sz_raw = _parse_int(raw.get("BidQty"))
+        ask_size = _ask_sz_raw if _ask_sz_raw > 0 else (asks[0].size if asks else 0)
+
+        ts_ns = _to_ns(
+            raw.get("CurrentPriceTime")
+            or raw.get("BidTime")
+            or raw.get("AskTime")
+        )
+        volume = _parse_int(raw.get("TradingVolume"))
+
+        out_of_order = bool(
+            prev is not None and ts_ns > 0 and prev.ts_ns > 0 and ts_ns < prev.ts_ns
+        )
+        duplicate = bool(
+            prev is not None
+            and not out_of_order
+            and ts_ns == prev.ts_ns
+            and bid == prev.bid
+            and ask == prev.ask
+            and bid_size == prev.bid_size
+            and ask_size == prev.ask_size
+            and volume == prev.volume
+        )
 
         snapshot = BoardSnapshot(
             symbol=str(raw.get("Symbol", "")),
             exchange=_parse_int(raw.get("Exchange"), 1),
-            ts_ns=_to_ns(
-                raw.get("CurrentPriceTime")
-                or raw.get("BidTime")
-                or raw.get("AskTime")
-            ),
+            ts_ns=ts_ns,
             bid=bid,
             ask=ask,
             bid_size=bid_size,
             ask_size=ask_size,
             last=_parse_float(raw.get("CurrentPrice")),
             last_size=0,
-            volume=_parse_int(raw.get("TradingVolume")),
+            volume=volume,
             vwap=_parse_float(raw.get("VWAP")),
             bids=bids,
             asks=asks,
             prev_board=prev,
+            duplicate=duplicate,
+            out_of_order=out_of_order,
         )
         if not snapshot.valid:
             return None
@@ -267,6 +293,7 @@ class KabuAdapter:
 
         weighted_value = 0.0
         weighted_qty = 0
+        latest_fill_ts_ns = 0
         for detail in details:
             if not isinstance(detail, dict):
                 continue
@@ -275,6 +302,9 @@ class KabuAdapter:
             if detail_qty > 0 and detail_price > 0:
                 weighted_value += detail_qty * detail_price
                 weighted_qty += detail_qty
+            detail_ts = _to_ns(detail.get("Time") or detail.get("RecvTime"))
+            if detail_ts > latest_fill_ts_ns:
+                latest_fill_ts_ns = detail_ts
 
         avg_fill_price = 0.0
         if weighted_qty > 0:
@@ -296,6 +326,7 @@ class KabuAdapter:
             state_code=state_code,
             order_state_code=order_state_code,
             is_final=is_final,
+            fill_ts_ns=latest_fill_ts_ns,
             raw=raw,
         )
 
@@ -637,25 +668,17 @@ class KabuWebSocket:
             return
 
         # Drop stale out-of-order quotes so they don't corrupt OFI deltas.
-        if prev_snapshot is not None and snapshot.ts_ns < prev_snapshot.ts_ns:
+        if snapshot.out_of_order:
             logger.debug(
                 "drop out-of-order quote symbol=%s prev_ts=%s new_ts=%s",
                 symbol,
-                prev_snapshot.ts_ns,
+                prev_snapshot.ts_ns if prev_snapshot else 0,
                 snapshot.ts_ns,
             )
             return
 
         # Drop exact duplicate events to avoid duplicate signal/order evaluation.
-        if (
-            prev_snapshot is not None
-            and snapshot.ts_ns == prev_snapshot.ts_ns
-            and snapshot.bid == prev_snapshot.bid
-            and snapshot.ask == prev_snapshot.ask
-            and snapshot.bid_size == prev_snapshot.bid_size
-            and snapshot.ask_size == prev_snapshot.ask_size
-            and snapshot.volume == prev_snapshot.volume
-        ):
+        if snapshot.duplicate:
             return
 
         latency_ms = max(0.0, (recv_ns - snapshot.ts_ns) / 1_000_000)

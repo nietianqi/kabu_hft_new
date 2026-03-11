@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta, timezone
 
+from kabu_hft.clock import Clock, LiveClock
 from kabu_hft.gateway import BoardSnapshot
 
 logger = logging.getLogger("kabu.risk")
@@ -62,11 +63,19 @@ class TradeRecord:
 
 
 class PnLTracker:
-    def __init__(self, daily_loss_limit: float, consecutive_loss_limit: int, cooling_seconds: int, max_hold_seconds: int):
+    def __init__(
+        self,
+        daily_loss_limit: float,
+        consecutive_loss_limit: int,
+        cooling_seconds: int,
+        max_hold_seconds: int,
+        clock: Clock = LiveClock(),
+    ):
         self.daily_loss_limit = daily_loss_limit
         self.consecutive_loss_limit = consecutive_loss_limit
         self.cooling_ns = cooling_seconds * 1_000_000_000
         self.max_hold_ns = max_hold_seconds * 1_000_000_000
+        self._clock = clock
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
         self.cooling_until_ns = 0
@@ -103,7 +112,7 @@ class PnLTracker:
         if pnl < 0:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.consecutive_loss_limit:
-                self.cooling_until_ns = time.time_ns() + self.cooling_ns
+                self.cooling_until_ns = self._clock.time_ns() + self.cooling_ns
         else:
             self.consecutive_losses = 0
         return pnl
@@ -125,7 +134,7 @@ class PnLTracker:
             "total_trades": total,
             "win_rate": wins / total if total else 0.0,
             "consecutive_losses": self.consecutive_losses,
-            "cooling": self.cooling_until_ns > time.time_ns(),
+            "cooling": self.cooling_until_ns > self._clock.time_ns(),
         }
 
 
@@ -181,9 +190,10 @@ class RiskGuard:
         tick_size: float,
         allow_short: bool,
         entry_threshold: float,
+        clock: Clock = LiveClock(),
     ):
         self.session = SessionGuard()
-        self.pnl = PnLTracker(daily_loss_limit, consecutive_loss_limit, cooling_seconds, max_hold_seconds)
+        self.pnl = PnLTracker(daily_loss_limit, consecutive_loss_limit, cooling_seconds, max_hold_seconds, clock=clock)
         self.vol = VolatilityEstimator()
         self.sizer = PositionSizer(base_qty, max_qty, max_inventory_qty, max_notional)
         self.max_spread = max_spread_ticks * tick_size

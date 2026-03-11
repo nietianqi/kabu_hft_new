@@ -6,8 +6,13 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
+from typing import Optional
+
+from kabu_hft.clock import Clock, LiveClock
 from kabu_hft.config import OrderProfile
 from kabu_hft.gateway import BoardSnapshot, KabuRestClient, OrderSnapshot, TradePrint
+from kabu_hft.oms.orders import OrderLedger, OrderStatus, WorkingOrderRecord
+from kabu_hft.oms.reconciliation import reconcile_order_state
 
 logger = logging.getLogger("kabu.execution")
 
@@ -46,6 +51,7 @@ class WorkingOrder:
     cum_qty: int = 0
     avg_fill_price: float = 0.0
     cancel_requested: bool = False
+    queue_ahead_qty: int = 0  # Estimated lots ahead of us in the queue (paper trading)
 
 
 @dataclass(slots=True)
@@ -198,7 +204,7 @@ class ExecutionController:
         *,
         symbol: str,
         exchange: int,
-        rest_client: KabuRestClient,
+        rest_client: Optional[KabuRestClient],
         order_profile: OrderProfile,
         dry_run: bool,
         tick_size: float,
@@ -209,6 +215,8 @@ class ExecutionController:
         max_requotes_per_minute: int,
         allow_aggressive_entry: bool,
         allow_aggressive_exit: bool,
+        clock: Clock = LiveClock(),
+        queue_model: bool = True,
     ):
         self.symbol = symbol
         self.exchange = exchange
@@ -226,11 +234,15 @@ class ExecutionController:
         self.min_order_lifetime_ns = min_order_lifetime_ms * 1_000_000
         self.requotes = RequoteBudget(max_requotes_per_minute)
 
+        self._clock = clock
+        self.queue_model = queue_model
         self.working_order: WorkingOrder | None = None
         self.inventory = Inventory()
         self.closed_trades: deque[RoundTrip] = deque()
         self.paper_order_counter = 0
         self.paper_last_fill_reason = ""
+        self.has_stranded_partial: bool = False
+        self._order_ledger = OrderLedger()
         self.stats = {
             "sent_orders": 0,
             "cancel_orders": 0,
@@ -310,10 +322,12 @@ class ExecutionController:
             return False
 
         self.stats["open_attempts"] += 1
-        now_ns = time.time_ns()
+        now_ns = self._clock.time_ns()
         if self.dry_run:
             order_id = self._next_paper_order_id()
         else:
+            if self.rest_client is None:
+                raise RuntimeError("rest_client is required for live trading (dry_run=False)")
             response = await self.rest_client.send_entry_order(
                 symbol=self.symbol,
                 exchange=self.exchange,
@@ -339,6 +353,13 @@ class ExecutionController:
             reason=reason,
             mode=mode.value,
         )
+        self._order_ledger.add(WorkingOrderRecord(
+            order_id=order_id,
+            symbol=self.symbol,
+            side=direction,
+            qty=qty,
+            price=decision.price,
+        ))
         self.stats["sent_orders"] += 1
         logger.info(
             "entry order sent symbol=%s side=%+d qty=%d price=%.3f market=%s mode=%s dry_run=%s",
@@ -355,6 +376,11 @@ class ExecutionController:
             fill_price = snapshot.ask if direction > 0 else snapshot.bid
             self._apply_fill(qty=qty, fill_price=fill_price, fill_ts_ns=now_ns)
             self._finalize_working_order(final_status="filled")
+        elif self.dry_run and self.queue_model and self.working_order is not None:
+            # Estimate queue position: we arrive at the back of the existing best-level queue.
+            self.working_order.queue_ahead_qty = (
+                snapshot.bid_size if direction > 0 else snapshot.ask_size
+            )
         return True
 
     async def close(
@@ -376,10 +402,12 @@ class ExecutionController:
         )
         qty = self.inventory.qty
         self.stats["close_attempts"] += 1
-        now_ns = time.time_ns()
+        now_ns = self._clock.time_ns()
         if self.dry_run:
             order_id = self._next_paper_order_id()
         else:
+            if self.rest_client is None:
+                raise RuntimeError("rest_client is required for live trading (dry_run=False)")
             response = await self.rest_client.send_exit_order(
                 symbol=self.symbol,
                 exchange=self.exchange,
@@ -404,6 +432,13 @@ class ExecutionController:
             sent_ts_ns=now_ns,
             reason=reason,
         )
+        self._order_ledger.add(WorkingOrderRecord(
+            order_id=order_id,
+            symbol=self.symbol,
+            side=-self.inventory.side,
+            qty=qty,
+            price=decision.price,
+        ))
         self.stats["sent_orders"] += 1
         logger.info(
             "exit order sent symbol=%s side=%+d qty=%d price=%.3f market=%s dry_run=%s reason=%s",
@@ -432,6 +467,8 @@ class ExecutionController:
         if self.dry_run:
             self._finalize_working_order(final_status="cancelled")
         else:
+            if self.rest_client is None:
+                raise RuntimeError("rest_client is required for live trading (dry_run=False)")
             await self.rest_client.cancel_order(order_id)
         self.stats["cancel_orders"] += 1
         logger.info("cancel requested symbol=%s order_id=%s reason=%s", self.symbol, order_id, reason)
@@ -459,7 +496,8 @@ class ExecutionController:
                 new_qty=snapshot.cum_qty,
                 new_avg=snapshot.avg_fill_price or snapshot.price,
             )
-            self._apply_fill(qty=new_qty, fill_price=fill_price, fill_ts_ns=time.time_ns())
+            fill_ts_ns = snapshot.fill_ts_ns if snapshot.fill_ts_ns > 0 else self._clock.time_ns()
+            self._apply_fill(qty=new_qty, fill_price=fill_price, fill_ts_ns=fill_ts_ns)
             self.working_order.cum_qty = snapshot.cum_qty
             self.working_order.avg_fill_price = snapshot.avg_fill_price or fill_price
 
@@ -473,9 +511,17 @@ class ExecutionController:
             return
 
         if self.working_order.side > 0 and snapshot.ask <= self.working_order.price:
-            self._paper_fill(limit_price=min(self.working_order.price, snapshot.ask), reason="quote_cross")
+            if self.queue_model and self.working_order.queue_ahead_qty > 0:
+                # Quote crossed through our level but we haven't burned the queue yet.
+                # Assume all existing depth at our level is consumed on a quote-cross.
+                self.working_order.queue_ahead_qty = 0
+            else:
+                self._paper_fill(limit_price=min(self.working_order.price, snapshot.ask), reason="quote_cross")
         elif self.working_order.side < 0 and snapshot.bid >= self.working_order.price:
-            self._paper_fill(limit_price=max(self.working_order.price, snapshot.bid), reason="quote_cross")
+            if self.queue_model and self.working_order.queue_ahead_qty > 0:
+                self.working_order.queue_ahead_qty = 0
+            else:
+                self._paper_fill(limit_price=max(self.working_order.price, snapshot.bid), reason="quote_cross")
 
     def sync_paper_trade(self, trade: TradePrint) -> None:
         if not self.dry_run or self.working_order is None:
@@ -484,14 +530,39 @@ class ExecutionController:
             return
 
         if self.working_order.side > 0 and trade.price <= self.working_order.price:
+            if self.queue_model:
+                self.working_order.queue_ahead_qty = max(0, self.working_order.queue_ahead_qty - trade.size)
+                if self.working_order.queue_ahead_qty > 0:
+                    return  # Still waiting in queue
             self._paper_fill(limit_price=min(self.working_order.price, trade.price), reason="trade_through")
         elif self.working_order.side < 0 and trade.price >= self.working_order.price:
+            if self.queue_model:
+                self.working_order.queue_ahead_qty = max(0, self.working_order.queue_ahead_qty - trade.size)
+                if self.working_order.queue_ahead_qty > 0:
+                    return  # Still waiting in queue
             self._paper_fill(limit_price=max(self.working_order.price, trade.price), reason="trade_through")
 
     def drain_round_trips(self) -> list[RoundTrip]:
         completed = list(self.closed_trades)
         self.closed_trades.clear()
         return completed
+
+    def reconcile_with_broker(self, broker_snapshot: OrderSnapshot) -> None:
+        """Apply broker order truth to the OMS ledger and log any divergence."""
+        local = self._order_ledger.get(broker_snapshot.order_id)
+        if local is None:
+            return
+        _, issue = reconcile_order_state(local, broker_snapshot)
+        if issue is not None:
+            logger.warning(
+                "reconciliation issue symbol=%s order_id=%s severity=%s msg=%s local=%s broker=%s",
+                self.symbol,
+                issue.order_id,
+                issue.severity,
+                issue.message,
+                issue.local_status,
+                issue.broker_status,
+            )
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -504,6 +575,7 @@ class ExecutionController:
             "working_order_price": self.working_order.price if self.working_order else 0.0,
             "working_order_mode": self.working_order.mode if self.working_order else "",
             "stats": dict(self.stats),
+            "ledger": self._order_ledger.snapshot(),
         }
 
     def _next_paper_order_id(self) -> str:
@@ -513,7 +585,7 @@ class ExecutionController:
     def _paper_fill(self, *, limit_price: float, reason: str) -> None:
         if self.working_order is None:
             return
-        now_ns = time.time_ns()
+        now_ns = self._clock.time_ns()
         self.paper_last_fill_reason = reason
         self._apply_fill(qty=self.working_order.qty - self.working_order.cum_qty, fill_price=limit_price, fill_ts_ns=now_ns)
         self._finalize_working_order(final_status="filled")
@@ -522,6 +594,7 @@ class ExecutionController:
         if qty <= 0 or self.working_order is None:
             return
 
+        self._order_ledger.apply_fill(self.working_order.order_id, qty, fill_price)
         self.stats["fills"] += 1
         if self.working_order.purpose == "entry":
             prev_qty = self.inventory.qty
@@ -562,13 +635,31 @@ class ExecutionController:
         purpose = self.working_order.purpose
         if purpose == "entry" and self.inventory.qty == 0:
             self._reset_inventory()
+        elif purpose == "entry" and final_status == "cancelled" and self.inventory.qty > 0:
+            # Entry was partially filled before cancel — inventory is stranded.
+            # Flag for strategy to force-close on next signal loop iteration.
+            self.has_stranded_partial = True
+            logger.warning(
+                "stranded partial fill symbol=%s order_id=%s partial_qty=%d — will force close",
+                self.symbol,
+                self.working_order.order_id,
+                self.inventory.qty,
+            )
         if purpose == "exit" and self.inventory.qty == 0:
             self._reset_inventory()
+
+        order_id = self.working_order.order_id
+        if final_status == "filled":
+            self._order_ledger.mark_working(order_id)  # ensure working state before implicit fill
+        elif final_status == "cancelled":
+            self._order_ledger.mark_canceled(order_id)
+        elif final_status == "rejected":
+            self._order_ledger.mark_rejected(order_id)
 
         logger.info(
             "order finalized symbol=%s order_id=%s purpose=%s status=%s inventory_qty=%d",
             self.symbol,
-            self.working_order.order_id,
+            order_id,
             purpose,
             final_status,
             self.inventory.qty,

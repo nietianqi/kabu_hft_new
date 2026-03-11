@@ -133,6 +133,11 @@ class HFTStrategy:
         if not self.started or snapshot.symbol != self.config.symbol:
             return
 
+        # Paper fill must be evaluated on every board event, even if throttled,
+        # to match live behavior where fills arrive independently of the rate limiter.
+        self.execution.sync_paper_board(snapshot)
+        self._mid_ref[0] = snapshot.mid
+
         now_ns = time.time_ns()
         if now_ns - self.last_board_ns < self.min_board_interval_ns:
             return
@@ -140,9 +145,6 @@ class HFTStrategy:
         self.board_count += 1
 
         self._last_snapshot = snapshot
-        self._mid_ref[0] = snapshot.mid
-
-        self.execution.sync_paper_board(snapshot)
         self._drain_completed_trades()
         self.risk.update_vol(snapshot)
 
@@ -174,6 +176,19 @@ class HFTStrategy:
 
     async def _process_signal(self, snapshot: BoardSnapshot, signal: SignalPacket, now_ns: int) -> None:
         self._drain_completed_trades()
+
+        # Handle stranded partial fill: entry was partially filled then cancelled.
+        # Force-close the residual inventory immediately before any other logic.
+        if self.execution.has_stranded_partial and self.execution.state is ExecutionState.OPEN:
+            self.execution.has_stranded_partial = False
+            await self.execution.close(
+                snapshot=snapshot,
+                score=0.0,
+                reason="stranded_partial_close",
+                force=True,
+            )
+            return
+
         now_dt = datetime.now(JST)
         score = signal.composite
         state = self.execution.state
@@ -403,6 +418,7 @@ class HFTStrategy:
                 for raw in records:
                     snapshot = KabuAdapter.order_snapshot(raw)
                     if snapshot is not None:
+                        self.execution.reconcile_with_broker(snapshot)
                         self.execution.sync_order_snapshot(snapshot)
                 self._drain_completed_trades()
             except Exception as exc:
