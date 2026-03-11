@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from datetime import datetime
+
+from kabu_hft.config import OrderProfile, StrategyConfig
+from kabu_hft.execution import ExecutionController, ExecutionState
+from kabu_hft.gateway import BoardSnapshot, KabuAdapter, KabuRestClient, TradePrint
+from kabu_hft.risk import RiskGuard
+from kabu_hft.signals import SignalPacket, SignalStack
+
+logger = logging.getLogger("kabu.strategy")
+
+
+class HFTStrategy:
+    def __init__(
+        self,
+        *,
+        config: StrategyConfig,
+        order_profile: OrderProfile,
+        rest_client: KabuRestClient,
+        dry_run: bool,
+    ):
+        self.config = config
+        self.rest_client = rest_client
+        self.dry_run = dry_run
+        self.signals = SignalStack(
+            obi_depth=config.obi_depth,
+            obi_decay=config.obi_decay,
+            lob_ofi_depth=config.lob_ofi_depth,
+            lob_ofi_decay=config.lob_ofi_decay,
+            tape_window_sec=config.tape_window_sec,
+            mp_ema_alpha=config.mp_ema_alpha,
+            tick_size=config.tick_size,
+            zscore_window=config.zscore_window,
+            weights=config.signal_weights,
+        )
+        self.risk = RiskGuard(
+            base_qty=config.base_qty,
+            max_qty=config.max_qty,
+            max_inventory_qty=config.max_inventory_qty,
+            max_notional=config.max_notional,
+            daily_loss_limit=config.daily_loss_limit,
+            consecutive_loss_limit=config.consecutive_loss_limit,
+            cooling_seconds=config.cooling_seconds,
+            max_hold_seconds=config.max_hold_seconds,
+            max_spread_ticks=config.max_spread_ticks,
+            stale_quote_ms=config.stale_quote_ms,
+            tick_size=config.tick_size,
+            allow_short=order_profile.allow_short,
+            entry_threshold=config.entry_threshold,
+        )
+        self.execution = ExecutionController(
+            symbol=config.symbol,
+            exchange=config.exchange,
+            rest_client=rest_client,
+            order_profile=order_profile,
+            dry_run=dry_run,
+            tick_size=config.tick_size,
+            strong_threshold=config.strong_threshold,
+            min_edge_ticks=config.min_edge_ticks,
+            max_pending_ms=config.max_pending_ms,
+            min_order_lifetime_ms=config.min_order_lifetime_ms,
+            max_requotes_per_minute=config.max_requotes_per_minute,
+            allow_aggressive_entry=config.allow_aggressive_entry,
+            allow_aggressive_exit=config.allow_aggressive_exit,
+        )
+
+        self.started = False
+        self.latest_item: tuple[BoardSnapshot, SignalPacket, int] | None = None
+        self.signal_event = asyncio.Event()
+        self.exec_task: asyncio.Task | None = None
+        self.timeout_task: asyncio.Task | None = None
+        self.reconcile_task: asyncio.Task | None = None
+        self.board_count = 0
+        self.trade_count = 0
+        self.signal_count = 0
+        self.last_board_ns = 0
+        self.min_board_interval_ns = int(config.min_board_interval_ms * 1_000_000)
+
+    async def start(self) -> None:
+        if self.started:
+            return
+        self.started = True
+        self.exec_task = asyncio.create_task(self._signal_loop(), name=f"{self.config.symbol}-signal-loop")
+        self.timeout_task = asyncio.create_task(self._timeout_loop(), name=f"{self.config.symbol}-timeout-loop")
+        if not self.dry_run:
+            self.reconcile_task = asyncio.create_task(self._reconcile_loop(), name=f"{self.config.symbol}-reconcile-loop")
+        logger.info("strategy started symbol=%s dry_run=%s", self.config.symbol, self.dry_run)
+
+    async def stop(self) -> None:
+        self.started = False
+        for task in (self.exec_task, self.timeout_task, self.reconcile_task):
+            if task is not None:
+                task.cancel()
+        for task in (self.exec_task, self.timeout_task, self.reconcile_task):
+            if task is None:
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    def on_board(self, snapshot: BoardSnapshot) -> None:
+        if not self.started or snapshot.symbol != self.config.symbol:
+            return
+
+        now_ns = time.time_ns()
+        if now_ns - self.last_board_ns < self.min_board_interval_ns:
+            return
+        self.last_board_ns = now_ns
+        self.board_count += 1
+
+        self.execution.sync_paper_board(snapshot)
+        self._drain_completed_trades()
+        self.risk.update_vol(snapshot)
+
+        signal = self.signals.on_board(snapshot)
+        self.signal_count += 1
+        self.latest_item = (snapshot, signal, now_ns)
+        self.signal_event.set()
+
+    def on_trade(self, trade: TradePrint) -> None:
+        if not self.started or trade.symbol != self.config.symbol:
+            return
+        self.trade_count += 1
+        self.signals.on_trade(trade)
+        self.execution.sync_paper_trade(trade)
+        self._drain_completed_trades()
+
+    async def _signal_loop(self) -> None:
+        while self.started:
+            await self.signal_event.wait()
+            self.signal_event.clear()
+            item = self.latest_item
+            if item is None:
+                continue
+            snapshot, signal, now_ns = item
+            try:
+                await self._process_signal(snapshot, signal, now_ns)
+            except Exception as exc:
+                logger.exception("signal loop error symbol=%s error=%s", self.config.symbol, exc)
+
+    async def _process_signal(self, snapshot: BoardSnapshot, signal: SignalPacket, now_ns: int) -> None:
+        self._drain_completed_trades()
+        state = self.execution.state
+        now_dt = datetime.now()
+        score = signal.composite
+
+        if state is ExecutionState.OPENING:
+            working = self.execution.working_order
+            if working is None:
+                return
+            desired = self.execution.preview_entry(
+                direction=working.side,
+                snapshot=snapshot,
+                score=abs(score),
+                microprice=signal.microprice,
+            )
+            should_cancel, reason = self.risk.should_cancel_entry(
+                working_price=working.price,
+                desired_price=desired.price,
+                signal_strength=abs(score),
+                working_age_ns=self.execution.working_age_ns(now_ns),
+                min_lifetime_ns=self.execution.min_order_lifetime_ns,
+                snapshot=snapshot,
+                now_ns=now_ns,
+            )
+            if should_cancel and self.execution.can_requote(now_ns):
+                await self.execution.cancel_working(reason=reason)
+            return
+
+        if state is ExecutionState.CLOSING:
+            must_close, reason = self.risk.must_close(
+                open_ts_ns=self.execution.inventory.opened_ts_ns,
+                snapshot=snapshot,
+                now_ns=now_ns,
+                now_dt=now_dt,
+            )
+            if must_close and self.execution.working_age_ns(now_ns) > self.execution.min_order_lifetime_ns:
+                await self.execution.cancel_working(reason=reason)
+            return
+
+        if state is ExecutionState.OPEN:
+            must_close, reason = self.risk.must_close(
+                open_ts_ns=self.execution.inventory.opened_ts_ns,
+                snapshot=snapshot,
+                now_ns=now_ns,
+                now_dt=now_dt,
+            )
+            signal_reversed = (
+                self.execution.inventory.side > 0 and score <= -self.config.exit_threshold
+            ) or (
+                self.execution.inventory.side < 0 and score >= self.config.exit_threshold
+            )
+            if must_close or signal_reversed:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason=reason or "signal_reverse",
+                    force=must_close or abs(score) >= self.config.strong_threshold,
+                )
+            return
+
+        direction = 1 if score > 0 else -1
+        allowed, reason = self.risk.can_open(
+            snapshot=snapshot,
+            direction=direction,
+            signal_strength=abs(score),
+            inventory_qty=self.execution.inventory.qty,
+            now_ns=now_ns,
+            now_dt=now_dt,
+        )
+        if not allowed:
+            return
+
+        qty = self.risk.calc_qty(
+            signal_strength=abs(score),
+            mid=snapshot.mid,
+            inventory_qty=self.execution.inventory.qty,
+        )
+        if qty <= 0:
+            return
+
+        await self.execution.open(
+            direction=direction,
+            qty=qty,
+            snapshot=snapshot,
+            score=abs(score),
+            microprice=signal.microprice,
+            reason="alpha_entry",
+        )
+
+    async def _timeout_loop(self) -> None:
+        while self.started:
+            await asyncio.sleep(0.25)
+            try:
+                await self.execution.check_timeout(time.time_ns())
+                self._drain_completed_trades()
+            except Exception as exc:
+                logger.exception("timeout loop error symbol=%s error=%s", self.config.symbol, exc)
+
+    async def _reconcile_loop(self) -> None:
+        interval = max(self.config.poll_interval_ms / 1000.0, 0.1)
+        while self.started:
+            await asyncio.sleep(interval)
+            order_id = self.execution.current_order_id
+            if not order_id:
+                continue
+            try:
+                records = await self.rest_client.get_orders(order_id=order_id)
+                for raw in records:
+                    snapshot = KabuAdapter.order_snapshot(raw)
+                    if snapshot is not None:
+                        self.execution.sync_order_snapshot(snapshot)
+                self._drain_completed_trades()
+            except Exception as exc:
+                logger.warning("reconcile error symbol=%s order_id=%s error=%s", self.config.symbol, order_id, exc)
+
+    def _drain_completed_trades(self) -> None:
+        for trade in self.execution.drain_round_trips():
+            self.risk.record_trade(
+                symbol=trade.symbol,
+                side=trade.side,
+                qty=trade.qty,
+                entry_price=trade.entry_price,
+                exit_price=trade.exit_price,
+                entry_ts_ns=trade.entry_ts_ns,
+                exit_ts_ns=trade.exit_ts_ns,
+                commission=0.0,
+            )
+
+    def status(self) -> dict[str, object]:
+        signal = self.signals.last
+        return {
+            "symbol": self.config.symbol,
+            "state": self.execution.state.value,
+            "board_count": self.board_count,
+            "trade_count": self.trade_count,
+            "signal_count": self.signal_count,
+            "execution": self.execution.snapshot(),
+            "risk": self.risk.summary(),
+            "signal": {
+                "composite": signal.composite if signal else 0.0,
+                "obi_z": signal.obi_z if signal else 0.0,
+                "lob_ofi_z": signal.lob_ofi_z if signal else 0.0,
+                "tape_ofi_z": signal.tape_ofi_z if signal else 0.0,
+            },
+        }
