@@ -50,8 +50,11 @@ class MarketStateDetector:
 
     def evaluate(self, snapshot: BoardSnapshot, now_ns: int | None = None) -> MarketStateView:
         now = now_ns if now_ns is not None else time.time_ns()
-        self._event_times.append(now)
-        while self._event_times and now - self._event_times[0] > self.state_window_ns:
+        # Use exchange timestamp for event rate to measure actual market frequency,
+        # not the rate at which the strategy loop processes events (which is throttled).
+        event_ts = snapshot.ts_ns if snapshot.ts_ns > 0 else now
+        self._event_times.append(event_ts)
+        while self._event_times and event_ts - self._event_times[0] > self.state_window_ns:
             self._event_times.popleft()
 
         spread_ticks = snapshot.spread / self.tick_size if snapshot.spread > 0 else 0.0
@@ -63,7 +66,7 @@ class MarketStateDetector:
             jump_ticks = abs(snapshot.mid - self._prev_mid) / self.tick_size
         self._prev_mid = snapshot.mid
 
-        event_rate_hz = self._event_rate_hz(now)
+        event_rate_hz = self._event_rate_hz(event_ts)
 
         if not snapshot.valid:
             return MarketStateView(

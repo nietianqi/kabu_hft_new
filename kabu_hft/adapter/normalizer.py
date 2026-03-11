@@ -1,4 +1,16 @@
+"""
+DEPRECATED: KabuNormalizer, NormalizedBook, NormalizedTrade, and NormalizedLevel
+are superseded by KabuAdapter / BoardSnapshot / TradePrint in kabu_hft.gateway.
+Use those types directly. This module will be removed in a future version.
+"""
 from __future__ import annotations
+
+import warnings
+warnings.warn(
+    "kabu_hft.adapter.normalizer is deprecated. Use kabu_hft.gateway.KabuAdapter instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from dataclasses import dataclass, field
 from datetime import datetime
