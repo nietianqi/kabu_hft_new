@@ -6,14 +6,15 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Optional
-
-import aiohttp
-import websockets
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from kabu_hft.config import OrderProfile
 
 logger = logging.getLogger("kabu.gateway")
+
+if TYPE_CHECKING:
+    import aiohttp
+    import websockets
 
 try:
     import orjson
@@ -335,11 +336,13 @@ class KabuRestClient:
         self.base_url = base_url.rstrip("/")
         self._token: str | None = None
         self._password: str | None = None
-        self._session: aiohttp.ClientSession | None = None
+        self._session: Any | None = None
         self._bucket = _TokenBucket(rate_per_sec)
 
     async def start(self) -> None:
         if self._session is None:
+            import aiohttp
+
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=5),
                 connector=aiohttp.TCPConnector(limit=16, keepalive_timeout=20),
@@ -403,7 +406,7 @@ class KabuRestClient:
             profile.front_order_type_market if is_market else profile.front_order_type_limit
         )
         body: dict[str, Any] = {
-            "Password": "",
+            "Password": self._password or "",
             "Symbol": symbol,
             "Exchange": exchange,
             "SecurityType": 1,
@@ -453,7 +456,7 @@ class KabuRestClient:
         )
         broker_side = -position_side
         body: dict[str, Any] = {
-            "Password": "",
+            "Password": self._password or "",
             "Symbol": symbol,
             "Exchange": exchange,
             "SecurityType": 1,
@@ -577,12 +580,14 @@ class KabuWebSocket:
         self._on_trade = on_trade
         self._on_reconnect = on_reconnect
         self._running = False
-        self._ws: websockets.ClientConnection | None = None
+        self._ws: Any | None = None
         self._snapshots: dict[str, BoardSnapshot] = {}
         self._volumes: dict[str, int] = {}
         self._last_trade_price: dict[str, float] = {}
 
     async def run(self) -> None:
+        import websockets
+
         self._running = True
         retry_sleep = 1.0
         while self._running:
@@ -629,6 +634,28 @@ class KabuWebSocket:
         prev_snapshot = self._snapshots.get(symbol)
         snapshot = KabuAdapter.board(data, prev_snapshot)
         if snapshot is None:
+            return
+
+        # Drop stale out-of-order quotes so they don't corrupt OFI deltas.
+        if prev_snapshot is not None and snapshot.ts_ns < prev_snapshot.ts_ns:
+            logger.debug(
+                "drop out-of-order quote symbol=%s prev_ts=%s new_ts=%s",
+                symbol,
+                prev_snapshot.ts_ns,
+                snapshot.ts_ns,
+            )
+            return
+
+        # Drop exact duplicate events to avoid duplicate signal/order evaluation.
+        if (
+            prev_snapshot is not None
+            and snapshot.ts_ns == prev_snapshot.ts_ns
+            and snapshot.bid == prev_snapshot.bid
+            and snapshot.ask == prev_snapshot.ask
+            and snapshot.bid_size == prev_snapshot.bid_size
+            and snapshot.ask_size == prev_snapshot.ask_size
+            and snapshot.volume == prev_snapshot.volume
+        ):
             return
 
         latency_ms = max(0.0, (recv_ns - snapshot.ts_ns) / 1_000_000)

@@ -76,8 +76,12 @@ class TradeJournal:
         self._markout_writer: csv.DictWriter | None = None
         self._trade_file = None
         self._markout_file = None
+        self._next_markout_id = 0
+        self._pending_markouts: dict[int, _MarkoutTask] = {}
+        self._pending_handles: dict[int, asyncio.TimerHandle] = {}
 
     def open(self) -> None:
+        self.trade_path.parent.mkdir(parents=True, exist_ok=True)
         trade_is_new = not self.trade_path.exists() or os.path.getsize(self.trade_path) == 0
         self._trade_file = open(self.trade_path, "a", newline="", encoding="utf-8")
         self._trade_writer = csv.DictWriter(self._trade_file, fieldnames=_TRADE_FIELDS)
@@ -85,6 +89,7 @@ class TradeJournal:
             self._trade_writer.writeheader()
 
         if self.markout_seconds > 0:
+            self.markout_path.parent.mkdir(parents=True, exist_ok=True)
             markout_is_new = not self.markout_path.exists() or os.path.getsize(self.markout_path) == 0
             self._markout_file = open(self.markout_path, "a", newline="", encoding="utf-8")
             self._markout_writer = csv.DictWriter(self._markout_file, fieldnames=_MARKOUT_FIELDS)
@@ -94,14 +99,17 @@ class TradeJournal:
         logger.info("journal opened trade=%s markout=%s", self.trade_path, self.markout_path)
 
     def close(self) -> None:
+        self._flush_pending_markouts()
         if self._trade_file is not None:
             self._trade_file.flush()
             self._trade_file.close()
             self._trade_file = None
+            self._trade_writer = None
         if self._markout_file is not None:
             self._markout_file.flush()
             self._markout_file.close()
             self._markout_file = None
+            self._markout_writer = None
 
     def log_trade(self, trade: "RoundTrip", signal: "SignalPacket | None") -> None:
         if self._trade_writer is None:
@@ -158,11 +166,25 @@ class TradeJournal:
         )
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            return
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                return
 
-        loop.call_later(self.markout_seconds, self._write_markout, task)
+        self._next_markout_id += 1
+        markout_id = self._next_markout_id
+        self._pending_markouts[markout_id] = task
+        handle = loop.call_later(self.markout_seconds, self._write_markout_due, markout_id)
+        self._pending_handles[markout_id] = handle
+
+    def _write_markout_due(self, markout_id: int) -> None:
+        self._pending_handles.pop(markout_id, None)
+        task = self._pending_markouts.pop(markout_id, None)
+        if task is None:
+            return
+        self._write_markout(task)
 
     def _write_markout(self, task: _MarkoutTask) -> None:
         if self._markout_writer is None or self._markout_file is None:
@@ -185,3 +207,13 @@ class TradeJournal:
         self._markout_writer.writerow(row)
         self._markout_file.flush()
         logger.debug("markout written symbol=%s markout_pnl=%.2f", task.symbol, markout_pnl)
+
+    def _flush_pending_markouts(self) -> None:
+        pending_ids = list(self._pending_markouts.keys())
+        for markout_id in pending_ids:
+            handle = self._pending_handles.pop(markout_id, None)
+            if handle is not None and not handle.cancelled():
+                handle.cancel()
+            task = self._pending_markouts.pop(markout_id, None)
+            if task is not None:
+                self._write_markout(task)

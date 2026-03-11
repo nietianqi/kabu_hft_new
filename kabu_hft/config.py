@@ -15,6 +15,9 @@ DEFAULT_CONFIG: dict = {
     "journal_path": "trades.csv",
     "markout_seconds": 30,
     "rate_limit_per_second": 4.0,
+    "fail_on_startup_positions": True,
+    "startup_position_products": [0, 2],
+    "shutdown_emergency_timeout_s": 5.0,
     "order_profile": {
         "mode": "cash",
         "allow_short": False,
@@ -199,6 +202,9 @@ class AppConfig:
     journal_path: str
     markout_seconds: int
     rate_limit_per_second: float
+    fail_on_startup_positions: bool
+    startup_position_products: list[int]
+    shutdown_emergency_timeout_s: float
     order_profile: OrderProfile
     strategies: list[StrategyConfig]
 
@@ -265,6 +271,9 @@ def load_config(path: str | Path | None) -> AppConfig:
         journal_path=str(payload.get("journal_path", "trades.csv")),
         markout_seconds=int(payload.get("markout_seconds", 30)),
         rate_limit_per_second=float(payload.get("rate_limit_per_second", 4.0)),
+        fail_on_startup_positions=bool(payload.get("fail_on_startup_positions", True)),
+        startup_position_products=[int(product) for product in payload.get("startup_position_products", [0, 2])],
+        shutdown_emergency_timeout_s=float(payload.get("shutdown_emergency_timeout_s", 5.0)),
         order_profile=order_profile,
         strategies=strategies,
     )

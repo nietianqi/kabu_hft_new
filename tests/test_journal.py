@@ -1,6 +1,6 @@
+import asyncio
 import csv
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -58,7 +58,8 @@ class TestTradeJournal(unittest.TestCase):
             journal.log_trade(trade, signal)
             journal.close()
 
-            rows = list(csv.DictReader(path.open()))
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             row = rows[0]
             self.assertEqual(row["symbol"], "9984")
@@ -76,7 +77,8 @@ class TestTradeJournal(unittest.TestCase):
             journal.log_trade(_make_round_trip(), None)
             journal.close()
 
-            rows = list(csv.DictReader(path.open()))
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["composite"], "")
 
@@ -94,7 +96,8 @@ class TestTradeJournal(unittest.TestCase):
             journal2.log_trade(_make_round_trip(exit_price=10020.0, realized_pnl=4000.0), None)
             journal2.close()
 
-            rows = list(csv.DictReader(path.open()))
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 2)
             self.assertAlmostEqual(float(rows[0]["realized_pnl"]), 3000.0, places=1)
             self.assertAlmostEqual(float(rows[1]["realized_pnl"]), 4000.0, places=1)
@@ -111,7 +114,8 @@ class TestTradeJournal(unittest.TestCase):
             journal.log_trade(trade, None)
             journal.close()
 
-            rows = list(csv.DictReader(path.open()))
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
             hold_ms = float(rows[0]["hold_ms"])
             self.assertAlmostEqual(hold_ms, 5000.0, places=0)
 
@@ -129,8 +133,40 @@ class TestTradeJournal(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "trades.csv"
             journal = TradeJournal(path, markout_seconds=0)
-            # Not calling open() — should silently do nothing
             journal.log_trade(_make_round_trip(), None)
+
+    def test_close_flushes_pending_markout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "trades.csv"
+            markout_path = Path(tmpdir) / "trades.markout.csv"
+            journal = TradeJournal(path, markout_seconds=30)
+            journal.open()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                journal.schedule_markout(
+                    trade=_make_round_trip(),
+                    mid_ref=[10050.0],
+                )
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+            journal.close()
+            with markout_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["markout_mid"], "10050.0000")
+
+    def test_open_creates_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "nested" / "logs" / "trades.csv"
+            journal = TradeJournal(path, markout_seconds=0)
+            journal.open()
+            journal.log_trade(_make_round_trip(), None)
+            journal.close()
+            self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

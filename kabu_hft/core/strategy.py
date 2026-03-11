@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from kabu_hft.config import OrderProfile, StrategyConfig
 from kabu_hft.execution import ExecutionController, ExecutionState
@@ -13,6 +13,7 @@ from kabu_hft.risk import RiskGuard
 from kabu_hft.signals import SignalPacket, SignalStack
 
 logger = logging.getLogger("kabu.strategy")
+JST = timezone(timedelta(hours=9))
 
 
 class HFTStrategy:
@@ -158,7 +159,7 @@ class HFTStrategy:
     async def _process_signal(self, snapshot: BoardSnapshot, signal: SignalPacket, now_ns: int) -> None:
         self._drain_completed_trades()
         state = self.execution.state
-        now_dt = datetime.now()
+        now_dt = datetime.now(JST)
         score = signal.composite
 
         if state is ExecutionState.OPENING:

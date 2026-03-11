@@ -28,9 +28,13 @@ class KabuHFTApp:
         self.strategies: dict[str, HFTStrategy] = {}
         self.journal: TradeJournal | None = None
         self.running = False
+        self._stopping = False
         self.status_task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
         self.journal = TradeJournal(
             trade_path=self.config.journal_path,
             markout_seconds=self.config.markout_seconds,
@@ -42,7 +46,11 @@ class KabuHFTApp:
         logger.info("token acquired")
 
         if not self.config.dry_run:
-            await self._check_existing_positions()
+            existing_positions = await self._check_existing_positions()
+            if existing_positions and self.config.fail_on_startup_positions:
+                raise RuntimeError(
+                    "startup blocked: existing broker positions detected while fail_on_startup_positions=true"
+                )
 
         for strategy_config in self.config.strategies:
             strategy = HFTStrategy(
@@ -70,28 +78,36 @@ class KabuHFTApp:
         await self.websocket.run()
 
     async def stop(self) -> None:
-        if not self.running:
+        if self._stopping:
             return
+        self._stopping = True
         self.running = False
 
-        if self.websocket is not None:
-            self.websocket.stop()
+        try:
+            if self.websocket is not None:
+                self.websocket.stop()
+                self.websocket = None
 
-        if self.status_task is not None:
-            self.status_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.status_task
+            if self.status_task is not None:
+                self.status_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.status_task
+                self.status_task = None
 
-        if not self.config.dry_run:
-            await self._emergency_close_all()
+            if not self.config.dry_run:
+                await self._emergency_close_all()
 
-        for strategy in self.strategies.values():
-            await strategy.stop()
+            for strategy in self.strategies.values():
+                await strategy.stop()
+            self.strategies.clear()
 
-        await self.rest.stop()
+            await self.rest.stop()
 
-        if self.journal is not None:
-            self.journal.close()
+            if self.journal is not None:
+                self.journal.close()
+                self.journal = None
+        finally:
+            self._stopping = False
 
     def _on_board(self, snapshot: BoardSnapshot) -> None:
         strategy = self.strategies.get(snapshot.symbol)
@@ -112,24 +128,48 @@ class KabuHFTApp:
         )
 
     async def _reregister_symbols(self) -> None:
+        if not self.running:
+            return
         try:
             await self._register_symbols()
             logger.info("symbols re-registered after WebSocket reconnect")
         except Exception as exc:
             logger.warning("re-registration failed after reconnect: %s", exc)
 
-    async def _check_existing_positions(self) -> None:
-        try:
-            raw_positions = await self.rest.get_positions()
-            open_positions = [pos for pos in raw_positions if isinstance(pos, dict)]
-            if open_positions:
-                logger.warning(
-                    "EXISTING OPEN POSITIONS DETECTED (%d). Review before trading: %s",
-                    len(open_positions),
-                    open_positions,
+    async def _check_existing_positions(self) -> list[dict]:
+        open_positions: list[dict] = []
+        seen_keys: set[str] = set()
+        for product in self.config.startup_position_products:
+            try:
+                raw_positions = await self.rest.get_positions(product=product)
+            except Exception as exc:
+                logger.warning("startup position check failed for product=%s: %s", product, exc)
+                continue
+
+            for position in raw_positions:
+                if not isinstance(position, dict):
+                    continue
+                if self._position_qty(position) <= 0:
+                    continue
+                key = str(
+                    position.get("ExecutionID")
+                    or position.get("HoldID")
+                    or position.get("ID")
+                    or f"{product}:{position.get('Symbol')}:{position.get('Side')}:{self._position_qty(position)}"
                 )
-        except Exception as exc:
-            logger.warning("startup position check failed: %s", exc)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                open_positions.append(position)
+
+        if open_positions:
+            logger.warning(
+                "EXISTING OPEN POSITIONS DETECTED (%d). fail_on_startup_positions=%s positions=%s",
+                len(open_positions),
+                self.config.fail_on_startup_positions,
+                open_positions,
+            )
+        return open_positions
 
     async def _emergency_close_all(self) -> None:
         tasks = [
@@ -139,7 +179,14 @@ class KabuHFTApp:
         ]
         if tasks:
             logger.warning("emergency closing %d open positions on shutdown", len(tasks))
-            await asyncio.wait(tasks, timeout=3.0)
+            done, pending = await asyncio.wait(
+                tasks, timeout=self.config.shutdown_emergency_timeout_s
+            )
+            for pending_task in pending:
+                pending_task.cancel()
+            for done_task in done:
+                with suppress(asyncio.CancelledError, Exception):
+                    _ = done_task.result()
 
     async def _status_loop(self) -> None:
         while self.running:
@@ -154,6 +201,18 @@ class KabuHFTApp:
                     status["risk"]["daily_pnl"],
                     status["signal"]["composite"],
                 )
+
+    @staticmethod
+    def _position_qty(position: dict) -> int:
+        for key in ("LeavesQty", "HoldQty", "Qty"):
+            raw_value = position.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                return int(float(raw_value))
+            except (TypeError, ValueError):
+                continue
+        return 0
 
 
 async def run_async(config_path: str) -> None:
@@ -173,18 +232,18 @@ async def run_async(config_path: str) -> None:
 
     runner = asyncio.create_task(app.start(), name="kabu-hft-app")
     waiter = asyncio.create_task(stop_event.wait(), name="stop-waiter")
-    done, _ = await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
-
-    if runner in done and runner.exception() is not None:
+    try:
+        done, _ = await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if runner in done and runner.exception() is not None:
+            raise runner.exception()
+    finally:
         waiter.cancel()
         with suppress(asyncio.CancelledError):
             await waiter
-        raise runner.exception()
-
-    await app.stop()
-    runner.cancel()
-    with suppress(asyncio.CancelledError):
-        await runner
+        await app.stop()
+        runner.cancel()
+        with suppress(asyncio.CancelledError):
+            await runner
 
 
 def main() -> None:

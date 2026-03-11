@@ -8,6 +8,9 @@
   "journal_path": "trades.csv",
   "markout_seconds": 30,
   "rate_limit_per_second": 4.0,
+  "fail_on_startup_positions": true,
+  "startup_position_products": [0, 2],
+  "shutdown_emergency_timeout_s": 5.0,
   "order_profile": {
     "mode": "cash",
     "allow_short": false,
