@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 import websockets
@@ -314,11 +314,29 @@ class KabuAdapter:
         )
 
 
+class _TokenBucket:
+    """Simple token-bucket rate limiter for outgoing REST requests."""
+
+    def __init__(self, rate_per_sec: float) -> None:
+        self._rate = max(rate_per_sec, 0.1)
+        self._interval = 1.0 / self._rate
+        self._next_allowed: float = 0.0
+
+    async def acquire(self) -> None:
+        now = time.monotonic()
+        wait = self._next_allowed - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._next_allowed = max(self._next_allowed, time.monotonic()) + self._interval
+
+
 class KabuRestClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, rate_per_sec: float = 4.0):
         self.base_url = base_url.rstrip("/")
         self._token: str | None = None
+        self._password: str | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._bucket = _TokenBucket(rate_per_sec)
 
     async def start(self) -> None:
         if self._session is None:
@@ -343,6 +361,7 @@ class KabuRestClient:
         if not token:
             raise KabuApiError("token response missing Token", payload=data)
         self._token = token
+        self._password = password
         return token
 
     async def register_symbols(self, symbols: list[dict[str, Any]]) -> dict[str, Any]:
@@ -366,7 +385,7 @@ class KabuRestClient:
         return await self._request_json(
             "PUT",
             "/kabusapi/cancelorder",
-            json_body={"OrderId": order_id, "Password": ""},
+            json_body={"OrderId": order_id, "Password": self._password or ""},
         )
 
     async def send_entry_order(
@@ -512,6 +531,8 @@ class KabuRestClient:
         if self._session is None:
             raise RuntimeError("REST session has not been started")
 
+        await self._bucket.acquire()
+
         url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/json"}
         if include_token:
@@ -549,10 +570,12 @@ class KabuWebSocket:
         url: str,
         on_board: Callable[[BoardSnapshot], None],
         on_trade: Callable[[TradePrint], None] | None = None,
+        on_reconnect: Callable[[], Awaitable[None]] | None = None,
     ):
         self._url = url
         self._on_board = on_board
         self._on_trade = on_trade
+        self._on_reconnect = on_reconnect
         self._running = False
         self._ws: websockets.ClientConnection | None = None
         self._snapshots: dict[str, BoardSnapshot] = {}
@@ -573,6 +596,11 @@ class KabuWebSocket:
                     self._ws = connection
                     retry_sleep = 1.0
                     logger.info("websocket connected: %s", self._url)
+                    if self._on_reconnect is not None:
+                        try:
+                            await self._on_reconnect()
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning("on_reconnect callback failed: %s", exc)
                     async for raw_message in connection:
                         if not self._running:
                             break

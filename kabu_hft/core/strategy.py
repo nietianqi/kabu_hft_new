@@ -8,6 +8,7 @@ from datetime import datetime
 from kabu_hft.config import OrderProfile, StrategyConfig
 from kabu_hft.execution import ExecutionController, ExecutionState
 from kabu_hft.gateway import BoardSnapshot, KabuAdapter, KabuRestClient, TradePrint
+from kabu_hft.journal import TradeJournal
 from kabu_hft.risk import RiskGuard
 from kabu_hft.signals import SignalPacket, SignalStack
 
@@ -22,6 +23,8 @@ class HFTStrategy:
         order_profile: OrderProfile,
         rest_client: KabuRestClient,
         dry_run: bool,
+        journal: TradeJournal | None = None,
+        markout_seconds: int = 30,
     ):
         self.config = config
         self.rest_client = rest_client
@@ -68,6 +71,12 @@ class HFTStrategy:
             allow_aggressive_exit=config.allow_aggressive_exit,
         )
 
+        self.journal = journal
+        self.markout_seconds = markout_seconds
+        self._last_snapshot: BoardSnapshot | None = None
+        self._signal_at_entry: SignalPacket | None = None
+        self._mid_ref: list[float] = [0.0]
+
         self.started = False
         self.latest_item: tuple[BoardSnapshot, SignalPacket, int] | None = None
         self.signal_event = asyncio.Event()
@@ -112,6 +121,9 @@ class HFTStrategy:
             return
         self.last_board_ns = now_ns
         self.board_count += 1
+
+        self._last_snapshot = snapshot
+        self._mid_ref[0] = snapshot.mid
 
         self.execution.sync_paper_board(snapshot)
         self._drain_completed_trades()
@@ -224,7 +236,7 @@ class HFTStrategy:
         if qty <= 0:
             return
 
-        await self.execution.open(
+        opened = await self.execution.open(
             direction=direction,
             qty=qty,
             snapshot=snapshot,
@@ -232,6 +244,37 @@ class HFTStrategy:
             microprice=signal.microprice,
             reason="alpha_entry",
         )
+        if opened:
+            self._signal_at_entry = signal
+
+    async def emergency_close(self) -> None:
+        """Attempt a forced market close of any open inventory. Called during shutdown."""
+        if not self.execution.has_inventory:
+            return
+        snapshot = self._last_snapshot
+        if snapshot is None or not snapshot.valid:
+            logger.warning(
+                "emergency_close symbol=%s: no valid snapshot, position may remain open",
+                self.config.symbol,
+            )
+            return
+        logger.warning(
+            "emergency_close symbol=%s side=%+d qty=%d",
+            self.config.symbol,
+            self.execution.inventory.side,
+            self.execution.inventory.qty,
+        )
+        if self.execution.working_order is not None:
+            await self.execution.cancel_working(reason="emergency_shutdown")
+            await asyncio.sleep(0.2)
+        await self.execution.close(
+            snapshot=snapshot,
+            score=0.0,
+            reason="emergency_shutdown",
+            force=True,
+        )
+        await asyncio.sleep(0.5)
+        self._drain_completed_trades()
 
     async def _timeout_loop(self) -> None:
         while self.started:
@@ -271,6 +314,10 @@ class HFTStrategy:
                 exit_ts_ns=trade.exit_ts_ns,
                 commission=0.0,
             )
+            if self.journal is not None:
+                self.journal.log_trade(trade, self._signal_at_entry)
+                self.journal.schedule_markout(trade=trade, mid_ref=self._mid_ref)
+            self._signal_at_entry = None
 
     def status(self) -> dict[str, object]:
         signal = self.signals.last

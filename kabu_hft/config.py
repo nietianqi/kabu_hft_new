@@ -12,6 +12,9 @@ DEFAULT_CONFIG: dict = {
     "ws_url": "ws://localhost:18080/kabusapi/websocket",
     "dry_run": True,
     "status_interval_s": 30,
+    "journal_path": "trades.csv",
+    "markout_seconds": 30,
+    "rate_limit_per_second": 4.0,
     "order_profile": {
         "mode": "cash",
         "allow_short": False,
@@ -69,7 +72,17 @@ DEFAULT_CONFIG: dict = {
             "max_inventory_qty": 300,
             "max_notional": 3_000_000,
             "daily_loss_limit": -50_000,
-        }
+        },
+        {
+            "symbol": "4568",
+            "exchange": 1,
+            "tick_size": 5.0,
+            "base_qty": 100,
+            "max_qty": 300,
+            "max_inventory_qty": 300,
+            "max_notional": 3_000_000,
+            "daily_loss_limit": -50_000,
+        },
     ],
 }
 
@@ -183,6 +196,9 @@ class AppConfig:
     ws_url: str
     dry_run: bool
     status_interval_s: int
+    journal_path: str
+    markout_seconds: int
+    rate_limit_per_second: float
     order_profile: OrderProfile
     strategies: list[StrategyConfig]
 
@@ -246,6 +262,9 @@ def load_config(path: str | Path | None) -> AppConfig:
         ws_url=str(payload.get("ws_url", "ws://localhost:18080/kabusapi/websocket")),
         dry_run=bool(payload.get("dry_run", True)),
         status_interval_s=int(payload.get("status_interval_s", 30)),
+        journal_path=str(payload.get("journal_path", "trades.csv")),
+        markout_seconds=int(payload.get("markout_seconds", 30)),
+        rate_limit_per_second=float(payload.get("rate_limit_per_second", 4.0)),
         order_profile=order_profile,
         strategies=strategies,
     )

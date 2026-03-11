@@ -5,6 +5,9 @@
   "ws_url": "ws://localhost:18080/kabusapi/websocket",
   "dry_run": true,
   "status_interval_s": 30,
+  "journal_path": "trades.csv",
+  "markout_seconds": 30,
+  "rate_limit_per_second": 4.0,
   "order_profile": {
     "mode": "cash",
     "allow_short": false,
