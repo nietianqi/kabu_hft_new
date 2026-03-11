@@ -78,6 +78,7 @@ class HFTStrategy:
             queue_spread_max_ticks=config.queue_spread_max_ticks,
             abnormal_max_spread_ticks=config.abnormal_max_spread_ticks,
             max_event_rate_hz=config.max_event_rate_hz,
+            event_burst_min_events=config.event_burst_min_events,
             state_window_ms=config.state_window_ms,
             jump_threshold_ticks=config.jump_threshold_ticks,
         )
@@ -339,7 +340,9 @@ class HFTStrategy:
                 self.execution.inventory.qty / self.config.max_inventory_qty,
             )
         spread_factor = 1.0 if snapshot.spread <= self.config.tick_size + 1e-9 else 0.8
-        alpha_factor = 1.0 + max(signal_strength - 1.0, 0.0) * 0.25
+        # Stronger alpha lowers retreat threshold so we are more willing to defend best level.
+        alpha_discount = min(max(signal_strength - 1.0, 0.0) * 0.20, 0.40)
+        alpha_factor = 1.0 - alpha_discount
         threshold = int(base * spread_factor * alpha_factor * (1.0 + inventory_ratio))
         return max(threshold, 1)
 

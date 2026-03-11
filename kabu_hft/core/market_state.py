@@ -35,6 +35,7 @@ class MarketStateDetector:
         max_event_rate_hz: float,
         state_window_ms: int,
         jump_threshold_ticks: float,
+        event_burst_min_events: int = 6,
     ) -> None:
         self.tick_size = max(tick_size, 1e-9)
         self.stale_quote_ms = max(stale_quote_ms, 1)
@@ -43,6 +44,7 @@ class MarketStateDetector:
         self.max_event_rate_hz = max(max_event_rate_hz, 1.0)
         self.state_window_ns = max(state_window_ms, 250) * 1_000_000
         self.jump_threshold_ticks = max(jump_threshold_ticks, 0.5)
+        self.event_burst_min_events = max(event_burst_min_events, 2)
         self._event_times: deque[int] = deque()
         self._prev_mid = 0.0
 
@@ -90,7 +92,10 @@ class MarketStateDetector:
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
             )
-        if event_rate_hz >= self.max_event_rate_hz:
+        if (
+            len(self._event_times) >= self.event_burst_min_events
+            and event_rate_hz >= self.max_event_rate_hz
+        ):
             return MarketStateView(
                 state=MarketState.ABNORMAL,
                 reason="event_burst",
@@ -130,4 +135,5 @@ class MarketStateDetector:
         if len(self._event_times) < 2:
             return 0.0
         duration_ns = max(now_ns - self._event_times[0], 1)
-        return len(self._event_times) * 1_000_000_000 / duration_ns
+        # N events contain (N-1) intervals.
+        return (len(self._event_times) - 1) * 1_000_000_000 / duration_ns

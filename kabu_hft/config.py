@@ -61,7 +61,8 @@ DEFAULT_CONFIG: dict = {
         "queue_spread_max_ticks": 1.0,
         "queue_min_top_qty": 300,
         "abnormal_max_spread_ticks": 6.0,
-        "max_event_rate_hz": 120.0,
+        "max_event_rate_hz": 160.0,
+        "event_burst_min_events": 6,
         "state_window_ms": 3000,
         "jump_threshold_ticks": 4.0,
         "max_requotes_per_minute": 30,
@@ -204,6 +205,7 @@ class StrategyConfig:
     queue_min_top_qty: int
     abnormal_max_spread_ticks: float
     max_event_rate_hz: float
+    event_burst_min_events: int
     state_window_ms: int
     jump_threshold_ticks: float
     max_requotes_per_minute: int
@@ -279,7 +281,8 @@ def load_config(path: str | Path | None) -> AppConfig:
                 queue_spread_max_ticks=float(merged.get("queue_spread_max_ticks", 1.0)),
                 queue_min_top_qty=int(merged.get("queue_min_top_qty", 300)),
                 abnormal_max_spread_ticks=float(merged.get("abnormal_max_spread_ticks", 6.0)),
-                max_event_rate_hz=float(merged.get("max_event_rate_hz", 120.0)),
+                max_event_rate_hz=float(merged.get("max_event_rate_hz", 160.0)),
+                event_burst_min_events=int(merged.get("event_burst_min_events", 6)),
                 state_window_ms=int(merged.get("state_window_ms", 3000)),
                 jump_threshold_ticks=float(merged.get("jump_threshold_ticks", 4.0)),
                 max_requotes_per_minute=int(merged.get("max_requotes_per_minute", 30)),

@@ -67,6 +67,51 @@ class MarketRegimeTests(unittest.TestCase):
         self.assertEqual(state.state, MarketState.ABNORMAL)
         self.assertEqual(state.reason, "stale_quote")
 
+    def test_event_rate_uses_intervals_not_samples(self) -> None:
+        detector = MarketStateDetector(
+            tick_size=1.0,
+            stale_quote_ms=1_000,
+            queue_spread_max_ticks=1.0,
+            abnormal_max_spread_ticks=6.0,
+            max_event_rate_hz=160.0,
+            state_window_ms=3_000,
+            jump_threshold_ticks=5.0,
+            event_burst_min_events=2,
+        )
+        base = time.time_ns()
+        detector.evaluate(_snapshot(bid=100.0, ask=101.0, ts_ns=base), now_ns=base)
+        second = detector.evaluate(
+            _snapshot(bid=100.0, ask=101.0, ts_ns=base + 8_000_000),
+            now_ns=base + 8_000_000,
+        )
+        self.assertEqual(second.state, MarketState.QUEUE)
+
+    def test_event_burst_requires_min_events(self) -> None:
+        detector = MarketStateDetector(
+            tick_size=1.0,
+            stale_quote_ms=1_000,
+            queue_spread_max_ticks=1.0,
+            abnormal_max_spread_ticks=6.0,
+            max_event_rate_hz=100.0,
+            state_window_ms=3_000,
+            jump_threshold_ticks=5.0,
+            event_burst_min_events=6,
+        )
+        base = time.time_ns()
+        for index in range(5):
+            state = detector.evaluate(
+                _snapshot(bid=100.0, ask=101.0, ts_ns=base + index * 1_000_000),
+                now_ns=base + index * 1_000_000,
+            )
+            self.assertEqual(state.state, MarketState.QUEUE)
+
+        burst = detector.evaluate(
+            _snapshot(bid=100.0, ask=101.0, ts_ns=base + 5_000_000),
+            now_ns=base + 5_000_000,
+        )
+        self.assertEqual(burst.state, MarketState.ABNORMAL)
+        self.assertEqual(burst.reason, "event_burst")
+
 
 if __name__ == "__main__":
     unittest.main()
