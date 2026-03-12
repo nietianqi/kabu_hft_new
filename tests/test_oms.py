@@ -63,6 +63,21 @@ class OmsTests(unittest.TestCase):
         self.assertIsNotNone(issue)
         self.assertEqual(reconciled.order_id, "A1")
 
+    def test_mark_filled_keeps_terminal_status(self) -> None:
+        ledger = OrderLedger()
+        record = WorkingOrderRecord(
+            order_id="A2",
+            symbol="9984",
+            side=1,
+            qty=100,
+            price=100.0,
+        )
+        ledger.add(record)
+        ledger.mark_working("A2")
+        ledger.apply_fill("A2", fill_qty=100, fill_price=100.0)
+        ledger.mark_filled("A2")
+        self.assertEqual(ledger.get("A2").status, OrderStatus.FILLED)  # type: ignore[union-attr]
+
 
 if __name__ == "__main__":
     unittest.main()

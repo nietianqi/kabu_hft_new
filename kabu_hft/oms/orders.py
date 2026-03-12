@@ -53,7 +53,7 @@ class OrderLedger:
 
     def mark_working(self, order_id: str) -> None:
         record = self._records.get(order_id)
-        if record:
+        if record and not record.is_final:
             record.status = OrderStatus.WORKING
 
     def mark_cancel_pending(self, order_id: str, reason: str = "") -> None:
@@ -91,6 +91,16 @@ class OrderLedger:
         record = self._records.get(order_id)
         if record:
             record.status = OrderStatus.REJECTED
+
+    def mark_filled(self, order_id: str) -> None:
+        record = self._records.get(order_id)
+        if record is None:
+            return
+        if record.cum_qty < record.qty:
+            record.cum_qty = record.qty
+        if record.avg_fill_price <= 0:
+            record.avg_fill_price = record.price
+        record.status = OrderStatus.FILLED
 
     def snapshot(self) -> dict[str, dict]:
         return {

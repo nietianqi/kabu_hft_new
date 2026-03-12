@@ -27,6 +27,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             max_requotes_per_minute=20,
             allow_aggressive_entry=False,
             allow_aggressive_exit=True,
+            queue_model=False,
         )
         snapshot = BoardSnapshot(
             symbol="9984",

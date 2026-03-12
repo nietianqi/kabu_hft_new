@@ -365,6 +365,7 @@ class ExecutionController:
             qty=qty,
             price=decision.price,
         ))
+        self._order_ledger.mark_working(order_id)
         self.stats["sent_orders"] += 1
         logger.info(
             "entry order sent symbol=%s side=%+d qty=%d price=%.3f market=%s mode=%s dry_run=%s",
@@ -444,6 +445,7 @@ class ExecutionController:
             qty=qty,
             price=decision.price,
         ))
+        self._order_ledger.mark_working(order_id)
         self.stats["sent_orders"] += 1
         logger.info(
             "exit order sent symbol=%s side=%+d qty=%d price=%.3f market=%s dry_run=%s reason=%s",
@@ -660,7 +662,7 @@ class ExecutionController:
 
         order_id = self.working_order.order_id
         if final_status == "filled":
-            self._order_ledger.mark_working(order_id)  # ensure working state before implicit fill
+            self._order_ledger.mark_filled(order_id)
         elif final_status == "cancelled":
             self._order_ledger.mark_canceled(order_id)
         elif final_status == "rejected":
