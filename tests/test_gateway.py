@@ -88,6 +88,25 @@ class GatewayAdapterTests(unittest.TestCase):
             int(datetime.fromisoformat("2026-03-11T09:00:01+09:00").timestamp() * 1_000_000_000),
         )
 
+    def test_board_timestamp_without_exchange_time_uses_zero(self) -> None:
+        raw = {
+            "Symbol": "9984",
+            "Exchange": 1,
+            "AskPrice": 9980,
+            "AskQty": 400,
+            "BidPrice": 9990,
+            "BidQty": 500,
+            "Buy1": {"Price": 9980, "Qty": 400},
+            "Sell1": {"Price": 9990, "Qty": 500},
+            "CurrentPrice": 9985,
+            "TradingVolume": 1000,
+        }
+        snapshot = KabuAdapter.board(raw, None)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.ts_ns, 0)
+        self.assertEqual(snapshot.ts_source, "no_exchange_time")
+
 
 class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_sendorder_uses_stored_password(self) -> None:
@@ -115,6 +134,48 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(captured["path"], "/kabusapi/sendorder")
         self.assertEqual(captured["json_body"]["Password"], "abc123")
+
+    async def test_margin_mode_uses_credit_branch(self) -> None:
+        captured: dict = {}
+
+        async def fake_request(method, path, **kwargs):
+            captured["json_body"] = kwargs.get("json_body")
+            return {"OrderId": "ORDER-1"}
+
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+        client._request_json = fake_request  # type: ignore[method-assign]
+
+        await client.send_entry_order(
+            symbol="9984",
+            exchange=1,
+            side=1,
+            qty=100,
+            price=9980.0,
+            is_market=False,
+            profile=OrderProfile(mode="margin"),
+        )
+        self.assertEqual(captured["json_body"]["CashMargin"], 2)
+        self.assertEqual(captured["json_body"]["MarginTradeType"], 3)
+
+    async def test_unknown_mode_is_rejected(self) -> None:
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+
+        async def fake_request(*_args, **_kwargs):
+            return {"OrderId": "ORDER-1"}
+
+        client._request_json = fake_request  # type: ignore[method-assign]
+        with self.assertRaises(ValueError):
+            await client.send_entry_order(
+                symbol="9984",
+                exchange=1,
+                side=1,
+                qty=100,
+                price=9980.0,
+                is_market=False,
+                profile=OrderProfile(mode="marginn"),
+            )
 
     async def test_ws_drops_duplicate_and_out_of_order_quote(self) -> None:
         board_events = []
@@ -148,6 +209,20 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
         ws._dispatch(json.dumps(out_of_order))
 
         self.assertEqual(len(board_events), 1)
+
+    async def test_ws_reset_stream_state_clears_volume_baseline(self) -> None:
+        ws = KabuWebSocket(
+            url="ws://localhost:18080/kabusapi/websocket",
+            on_board=lambda _snapshot: None,
+            on_trade=None,
+        )
+        ws._volumes["9984"] = 123  # type: ignore[attr-defined]
+        ws._snapshots["9984"] = object()  # type: ignore[attr-defined]
+        ws._last_trade_price["9984"] = 9999.0  # type: ignore[attr-defined]
+        ws._reset_stream_state()
+        self.assertEqual(ws._volumes, {})  # type: ignore[attr-defined]
+        self.assertEqual(ws._snapshots, {})  # type: ignore[attr-defined]
+        self.assertEqual(ws._last_trade_price, {})  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

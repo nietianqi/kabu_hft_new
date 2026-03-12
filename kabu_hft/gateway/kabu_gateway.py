@@ -73,6 +73,28 @@ def _internal_side(raw_side: Any) -> int:
     return 0
 
 
+_MARGIN_MODES: frozenset[str] = frozenset(
+    {
+        "margin",
+        "margin_daytrade",
+        "margin_general",
+        "credit",
+        "shinyo",
+    }
+)
+
+
+def _is_margin_mode(mode: str) -> bool:
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"", "cash", "spot"}:
+        return False
+    if normalized in _MARGIN_MODES:
+        return True
+    raise ValueError(
+        f"unsupported order_profile.mode={mode!r}; expected one of cash/spot/margin variants"
+    )
+
+
 @dataclass(slots=True)
 class Level:
     price: float
@@ -219,8 +241,8 @@ class KabuAdapter:
             ts_ns = current_ts_ns
             ts_source = "current_price_time"
         else:
-            ts_ns = time.time_ns()
-            ts_source = "local_now_fallback"
+            ts_ns = 0
+            ts_source = "no_exchange_time"
         volume = _parse_int(raw.get("TradingVolume"))
 
         out_of_order = bool(
@@ -483,7 +505,7 @@ class KabuRestClient:
             "AccountType": profile.account_type,
         }
 
-        if profile.mode == "margin_daytrade":
+        if _is_margin_mode(profile.mode):
             body.update(
                 {
                     "CashMargin": 2,
@@ -533,7 +555,7 @@ class KabuRestClient:
             "AccountType": profile.account_type,
         }
 
-        if profile.mode == "margin_daytrade":
+        if _is_margin_mode(profile.mode):
             body.update(
                 {
                     "CashMargin": 3,
@@ -667,6 +689,7 @@ class KabuWebSocket:
             try:
                 connection = await self._connect(websockets)
                 self._ws = connection
+                self._reset_stream_state()
                 retry_sleep = 1.0
                 logger.info("websocket connected: %s", self._url)
                 if self._on_reconnect is not None:
@@ -699,6 +722,11 @@ class KabuWebSocket:
 
     def set_api_token(self, token: str | None) -> None:
         self._api_token = token or ""
+
+    def _reset_stream_state(self) -> None:
+        self._snapshots.clear()
+        self._volumes.clear()
+        self._last_trade_price.clear()
 
     async def _connect(self, websockets_module: Any) -> Any:
         kwargs: dict[str, Any] = {
@@ -743,7 +771,11 @@ class KabuWebSocket:
         if snapshot.duplicate:
             return
 
-        latency_ms = max(0.0, (recv_ns - snapshot.ts_ns) / 1_000_000)
+        latency_ms = (
+            max(0.0, (recv_ns - snapshot.ts_ns) / 1_000_000)
+            if snapshot.ts_ns > 0
+            else -1.0
+        )
         bid_latency_ms = (
             max(0.0, (recv_ns - snapshot.bid_ts_ns) / 1_000_000)
             if snapshot.bid_ts_ns > 0
@@ -759,8 +791,8 @@ class KabuWebSocket:
             if snapshot.current_ts_ns > 0
             else -1.0
         )
-        self._record_latency(symbol, latency_ms)
-
+        if latency_ms >= 0:
+            self._record_latency(symbol, latency_ms)
         if latency_ms > 500 and self._should_log_latency_warn(symbol, recv_ns):
             logger.warning(
                 "market data latency %.1fms for %s (source=%s bid=%.1fms ask=%.1fms current=%.1fms)",
@@ -771,7 +803,8 @@ class KabuWebSocket:
                 ask_latency_ms,
                 current_latency_ms,
             )
-        self._maybe_log_latency_stats(symbol, recv_ns)
+        if latency_ms >= 0:
+            self._maybe_log_latency_stats(symbol, recv_ns)
 
         prev_volume = self._volumes.get(symbol, snapshot.volume)
         self._snapshots[symbol] = snapshot

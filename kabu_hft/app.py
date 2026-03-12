@@ -25,7 +25,7 @@ class KabuHFTApp:
         self.config = config
         self.rest = KabuRestClient(config.base_url, rate_per_sec=config.rate_limit_per_second)
         self.websocket: KabuWebSocket | None = None
-        self.strategies: dict[str, HFTStrategy] = {}
+        self.strategies: dict[tuple[str, int], HFTStrategy] = {}
         self.journal: TradeJournal | None = None
         self.running = False
         self._stopping = False
@@ -62,7 +62,13 @@ class KabuHFTApp:
                 markout_seconds=self.config.markout_seconds,
             )
             await strategy.start()
-            self.strategies[strategy_config.symbol] = strategy
+            key = (strategy_config.symbol, strategy_config.exchange)
+            if key in self.strategies:
+                raise ValueError(
+                    f"duplicate strategy key detected symbol={strategy_config.symbol} "
+                    f"exchange={strategy_config.exchange}"
+                )
+            self.strategies[key] = strategy
 
         await self._register_symbols()
         logger.info("registered %d symbols", len(self.strategies))
@@ -111,12 +117,12 @@ class KabuHFTApp:
             self._stopping = False
 
     def _on_board(self, snapshot: BoardSnapshot) -> None:
-        strategy = self.strategies.get(snapshot.symbol)
+        strategy = self._find_strategy(snapshot.symbol, snapshot.exchange)
         if strategy is not None:
             strategy.on_board(snapshot)
 
     def _on_trade(self, trade: TradePrint) -> None:
-        strategy = self.strategies.get(trade.symbol)
+        strategy = self._find_strategy(trade.symbol, trade.exchange)
         if strategy is not None:
             strategy.on_trade(trade)
 
@@ -166,6 +172,19 @@ class KabuHFTApp:
                 f"kabu PUSH supports at most 50 registered symbols; got {len(symbols)}"
             )
         return symbols
+
+    def _find_strategy(self, symbol: str, exchange: int) -> HFTStrategy | None:
+        strategy = self.strategies.get((symbol, exchange))
+        if strategy is not None:
+            return strategy
+        candidates = [
+            candidate
+            for candidate in self.strategies.values()
+            if candidate.config.symbol == symbol
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     async def _check_existing_positions(self) -> list[dict]:
         open_positions: list[dict] = []

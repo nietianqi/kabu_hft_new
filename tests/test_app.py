@@ -13,15 +13,16 @@ class AppRegistrationTests(unittest.TestCase):
     def test_register_payload_deduplicates_same_symbol_exchange(self) -> None:
         app = KabuHFTApp(load_config(None))
         app.strategies = {
-            "s1": _fake_strategy("9984", 1),
-            "s2": _fake_strategy("9984", 1),
-            "s3": _fake_strategy("4568", 1),
+            ("9984", 1): _fake_strategy("9984", 1),
+            ("9984", 3): _fake_strategy("9984", 3),
+            ("4568", 1): _fake_strategy("4568", 1),
         }
         payload = app._build_register_symbols()
         self.assertEqual(
             payload,
             [
                 {"Symbol": "9984", "Exchange": 1},
+                {"Symbol": "9984", "Exchange": 3},
                 {"Symbol": "4568", "Exchange": 1},
             ],
         )
@@ -29,11 +30,33 @@ class AppRegistrationTests(unittest.TestCase):
     def test_register_payload_rejects_more_than_50_symbols(self) -> None:
         app = KabuHFTApp(load_config(None))
         app.strategies = {
-            f"s{index}": _fake_strategy(f"{7000 + index}", 1)
+            (f"{7000 + index}", 1): _fake_strategy(f"{7000 + index}", 1)
             for index in range(51)
         }
         with self.assertRaises(ValueError):
             app._build_register_symbols()
+
+    def test_find_strategy_uses_exact_symbol_exchange(self) -> None:
+        app = KabuHFTApp(load_config(None))
+        exact = _fake_strategy("9984", 3)
+        app.strategies = {
+            ("9984", 1): _fake_strategy("9984", 1),
+            ("9984", 3): exact,
+        }
+        self.assertIs(app._find_strategy("9984", 3), exact)
+
+    def test_find_strategy_fallback_only_when_symbol_unique(self) -> None:
+        app = KabuHFTApp(load_config(None))
+        only = _fake_strategy("7269", 1)
+        app.strategies = {
+            ("7269", 1): only,
+        }
+        self.assertIs(app._find_strategy("7269", 27), only)
+        app.strategies = {
+            ("9984", 1): _fake_strategy("9984", 1),
+            ("9984", 3): _fake_strategy("9984", 3),
+        }
+        self.assertIsNone(app._find_strategy("9984", 27))
 
 
 if __name__ == "__main__":
