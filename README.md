@@ -71,6 +71,19 @@ python -m unittest tests.test_replay -v
 python -m unittest tests.test_journal -v
 ```
 
+## Latency Report
+
+Compare environments (for example home PC vs AWS) from runtime logs:
+
+```bash
+python -m kabu_hft.telemetry.latency_report ^
+  --log home.log --label home ^
+  --log aws.log --label aws ^
+  --json-out latency_report.json
+```
+
+Optional: add `--trades-csv trades.csv` to include stale-exit rate from trade logs.
+
 ## Docs
 
 - [Design](docs/DESIGN.md)
