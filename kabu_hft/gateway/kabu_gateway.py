@@ -96,6 +96,11 @@ class BoardSnapshot:
     prev_board: Optional["BoardSnapshot"] = field(default=None, repr=False)
     duplicate: bool = False
     out_of_order: bool = False
+    # 気配フラグ (quote sign) from kabu Station API.
+    # Note: field names are reversed in the API — AskSign carries the bid-side sign,
+    # BidSign carries the ask-side sign.  We store them corrected here.
+    bid_sign: str = ""   # from kabu AskSign (bid side, naming is reversed in API)
+    ask_sign: str = ""   # from kabu BidSign (ask side, naming is reversed in API)
 
     @property
     def mid(self) -> float:
@@ -192,6 +197,10 @@ class KabuAdapter:
         _ask_sz_raw = _parse_int(raw.get("BidQty"))
         ask_size = _ask_sz_raw if _ask_sz_raw > 0 else (asks[0].size if asks else 0)
 
+        # 気配フラグ — kabu API names are reversed: AskSign carries bid-side, BidSign carries ask-side.
+        bid_sign = str(raw.get("AskSign") or "")
+        ask_sign = str(raw.get("BidSign") or "")
+
         ts_ns = _to_ns(
             raw.get("CurrentPriceTime")
             or raw.get("BidTime")
@@ -230,6 +239,8 @@ class KabuAdapter:
             prev_board=prev,
             duplicate=duplicate,
             out_of_order=out_of_order,
+            bid_sign=bid_sign,
+            ask_sign=ask_sign,
         )
         if not snapshot.valid:
             return None

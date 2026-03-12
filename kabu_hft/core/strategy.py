@@ -144,6 +144,11 @@ class HFTStrategy:
         self.last_board_ns = now_ns
         self.board_count += 1
 
+        # Duplicate (same quote/volume/ts as previous) and out-of-order boards
+        # carry no new information.  Paper fill already ran above; skip signals.
+        if snapshot.duplicate or snapshot.out_of_order:
+            return
+
         self._last_snapshot = snapshot
         self._drain_completed_trades()
         self.risk.update_vol(snapshot)

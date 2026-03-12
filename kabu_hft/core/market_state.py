@@ -14,6 +14,12 @@ class MarketState(str, Enum):
     ABNORMAL = "ABNORMAL"
 
 
+# 気配フラグ values that indicate non-normal quote states.
+# 0102 = 特別気配 (special/circuit-breaker), 0103 = 注意気配 (warning),
+# 0107 = 寄前気配 (pre-open).  0101 = 一般気配 (normal, not in this set).
+_SPECIAL_QUOTE_SIGNS: frozenset[str] = frozenset({"0102", "0103", "0107"})
+
+
 @dataclass(slots=True)
 class MarketStateView:
     state: MarketState
@@ -81,6 +87,15 @@ class MarketStateDetector:
             return MarketStateView(
                 state=MarketState.ABNORMAL,
                 reason="stale_quote",
+                spread_ticks=spread_ticks,
+                event_rate_hz=event_rate_hz,
+                stale_ms=stale_ms,
+                jump_ticks=jump_ticks,
+            )
+        if snapshot.bid_sign in _SPECIAL_QUOTE_SIGNS or snapshot.ask_sign in _SPECIAL_QUOTE_SIGNS:
+            return MarketStateView(
+                state=MarketState.ABNORMAL,
+                reason="special_quote_sign",
                 spread_ticks=spread_ticks,
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
