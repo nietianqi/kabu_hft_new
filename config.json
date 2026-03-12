@@ -1,6 +1,6 @@
 {
   "_comment": "kabu HFT sample config",
-  "api_password": "YOUR_KABU_API_PASSWORD",
+  "api_password": "japan202303",
   "base_url": "http://localhost:18080",
   "ws_url": "ws://localhost:18080/kabusapi/websocket",
   "dry_run": true,
@@ -70,20 +70,11 @@
     }
   },
   "symbols": [
+
     {
-      "symbol": "9984",
+      "symbol": "7269",
       "exchange": 1,
-      "tick_size": 50.0,
-      "base_qty": 100,
-      "max_qty": 300,
-      "max_inventory_qty": 300,
-      "max_notional": 3000000,
-      "daily_loss_limit": -50000
-    },
-    {
-      "symbol": "4568",
-      "exchange": 1,
-      "tick_size": 5.0,
+      "tick_size": 0.5,
       "base_qty": 100,
       "max_qty": 200,
       "max_inventory_qty": 200,
