@@ -270,7 +270,7 @@ class KabuAdapter:
         return TradePrint(
             symbol=str(raw.get("Symbol", "")),
             exchange=_parse_int(raw.get("Exchange"), 1),
-            ts_ns=_to_ns(raw.get("CurrentPriceTime")),
+            ts_ns=_to_ns(raw.get("TradingVolumeTime") or raw.get("CurrentPriceTime")),
             price=price,
             size=size,
             side=side,
@@ -397,6 +397,10 @@ class KabuRestClient:
         self._token = token
         self._password = password
         return token
+
+    @property
+    def token(self) -> str | None:
+        return self._token
 
     async def register_symbols(self, symbols: list[dict[str, Any]]) -> dict[str, Any]:
         return await self._request_json("PUT", "/kabusapi/register", json_body={"Symbols": symbols})
@@ -605,11 +609,13 @@ class KabuWebSocket:
         on_board: Callable[[BoardSnapshot], None],
         on_trade: Callable[[TradePrint], None] | None = None,
         on_reconnect: Callable[[], Awaitable[None]] | None = None,
+        api_token: str | None = None,
     ):
         self._url = url
         self._on_board = on_board
         self._on_trade = on_trade
         self._on_reconnect = on_reconnect
+        self._api_token = api_token or ""
         self._running = False
         self._ws: Any | None = None
         self._snapshots: dict[str, BoardSnapshot] = {}
@@ -623,24 +629,19 @@ class KabuWebSocket:
         retry_sleep = 1.0
         while self._running:
             try:
-                async with websockets.connect(
-                    self._url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    max_size=2**20,
-                ) as connection:
-                    self._ws = connection
-                    retry_sleep = 1.0
-                    logger.info("websocket connected: %s", self._url)
-                    if self._on_reconnect is not None:
-                        try:
-                            await self._on_reconnect()
-                        except Exception as exc:  # pragma: no cover
-                            logger.warning("on_reconnect callback failed: %s", exc)
-                    async for raw_message in connection:
-                        if not self._running:
-                            break
-                        self._dispatch(raw_message)
+                connection = await self._connect(websockets)
+                self._ws = connection
+                retry_sleep = 1.0
+                logger.info("websocket connected: %s", self._url)
+                if self._on_reconnect is not None:
+                    try:
+                        await self._on_reconnect()
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("on_reconnect callback failed: %s", exc)
+                async for raw_message in connection:
+                    if not self._running:
+                        break
+                    self._dispatch(raw_message)
             except Exception as exc:  # pragma: no cover - network dependent
                 if not self._running:
                     break
@@ -648,12 +649,37 @@ class KabuWebSocket:
                 await asyncio.sleep(retry_sleep)
                 retry_sleep = min(retry_sleep * 2, 5.0)
             finally:
+                if self._ws is not None:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
                 self._ws = None
 
     def stop(self) -> None:
         self._running = False
         if self._ws is not None:
             asyncio.create_task(self._ws.close())
+
+    def set_api_token(self, token: str | None) -> None:
+        self._api_token = token or ""
+
+    async def _connect(self, websockets_module: Any) -> Any:
+        kwargs: dict[str, Any] = {
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "max_size": 2**20,
+        }
+        if self._api_token:
+            headers = {"X-API-KEY": self._api_token}
+            kwargs["additional_headers"] = headers
+            try:
+                return await websockets_module.connect(self._url, **kwargs)
+            except TypeError:
+                kwargs.pop("additional_headers", None)
+                kwargs["extra_headers"] = headers
+                return await websockets_module.connect(self._url, **kwargs)
+        return await websockets_module.connect(self._url, **kwargs)
 
     def _dispatch(self, raw_message: str | bytes) -> None:
         recv_ns = time.time_ns()

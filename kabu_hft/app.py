@@ -8,7 +8,7 @@ from contextlib import suppress
 
 from kabu_hft.config import AppConfig, load_config
 from kabu_hft.core import HFTStrategy
-from kabu_hft.gateway import BoardSnapshot, KabuRestClient, KabuWebSocket, TradePrint
+from kabu_hft.gateway import BoardSnapshot, KabuApiError, KabuRestClient, KabuWebSocket, TradePrint
 from kabu_hft.journal import TradeJournal
 
 logging.basicConfig(
@@ -72,6 +72,7 @@ class KabuHFTApp:
             on_board=self._on_board,
             on_trade=self._on_trade,
             on_reconnect=self._reregister_symbols,
+            api_token=self.rest.token,
         )
         self.running = True
         self.status_task = asyncio.create_task(self._status_loop(), name="status-loop")
@@ -120,12 +121,11 @@ class KabuHFTApp:
             strategy.on_trade(trade)
 
     async def _register_symbols(self) -> None:
-        await self.rest.register_symbols(
-            [
-                {"Symbol": strategy.config.symbol, "Exchange": strategy.config.exchange}
-                for strategy in self.strategies.values()
-            ]
-        )
+        symbols = self._build_register_symbols()
+        if not symbols:
+            logger.warning("no symbols to register")
+            return
+        await self.rest.register_symbols(symbols)
 
     async def _reregister_symbols(self) -> None:
         if not self.running:
@@ -133,8 +133,39 @@ class KabuHFTApp:
         try:
             await self._register_symbols()
             logger.info("symbols re-registered after WebSocket reconnect")
+        except KabuApiError as exc:
+            if exc.status not in {401, 403}:
+                logger.warning("re-registration failed after reconnect: %s", exc)
+                return
+            logger.warning("re-registration unauthorized, refreshing token and retrying")
+            await self.rest.get_token(self.config.api_password)
+            if self.websocket is not None:
+                self.websocket.set_api_token(self.rest.token)
+            await self._register_symbols()
+            logger.info("token refreshed and symbols re-registered after reconnect")
         except Exception as exc:
             logger.warning("re-registration failed after reconnect: %s", exc)
+
+    def _build_register_symbols(self) -> list[dict[str, int | str]]:
+        symbols: list[dict[str, int | str]] = []
+        seen: set[tuple[str, int]] = set()
+        for strategy in self.strategies.values():
+            key = (strategy.config.symbol, strategy.config.exchange)
+            if key in seen:
+                logger.warning(
+                    "duplicate symbol config skipped symbol=%s exchange=%s",
+                    strategy.config.symbol,
+                    strategy.config.exchange,
+                )
+                continue
+            seen.add(key)
+            symbols.append({"Symbol": key[0], "Exchange": key[1]})
+
+        if len(symbols) > 50:
+            raise ValueError(
+                f"kabu PUSH supports at most 50 registered symbols; got {len(symbols)}"
+            )
+        return symbols
 
     async def _check_existing_positions(self) -> list[dict]:
         open_positions: list[dict] = []

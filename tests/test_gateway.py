@@ -46,6 +46,23 @@ class GatewayAdapterTests(unittest.TestCase):
         self.assertEqual(trade.size, 200)
         self.assertEqual(trade.price, 9990.0)
 
+    def test_trade_prefers_trading_volume_time_when_present(self) -> None:
+        raw = {
+            "Symbol": "9984",
+            "Exchange": 1,
+            "CurrentPrice": 9990,
+            "CurrentPriceTime": "2026-03-11T09:00:01+09:00",
+            "TradingVolumeTime": "2026-03-11T09:00:02+09:00",
+            "TradingVolume": 1200,
+        }
+        trade = KabuAdapter.trade(raw, None, prev_volume=1000, last_trade_price=9985)
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(
+            trade.ts_ns,
+            int(datetime.fromisoformat("2026-03-11T09:00:02+09:00").timestamp() * 1_000_000_000),
+        )
+
 
 class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_sendorder_uses_stored_password(self) -> None:
