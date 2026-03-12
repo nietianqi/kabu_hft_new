@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
@@ -48,11 +49,11 @@ def _parse_int(value: Any, default: int = 0) -> int:
 
 def _to_ns(ts_str: str | None) -> int:
     if not ts_str:
-        return time.time_ns()
+        return 0
     try:
         return int(datetime.fromisoformat(ts_str).timestamp() * 1_000_000_000)
     except ValueError:
-        return time.time_ns()
+        return 0
 
 
 def _kabu_side(internal_side: int) -> str:
@@ -101,6 +102,10 @@ class BoardSnapshot:
     # BidSign carries the ask-side sign.  We store them corrected here.
     bid_sign: str = ""   # from kabu AskSign (bid side, naming is reversed in API)
     ask_sign: str = ""   # from kabu BidSign (ask side, naming is reversed in API)
+    bid_ts_ns: int = 0
+    ask_ts_ns: int = 0
+    current_ts_ns: int = 0
+    ts_source: str = ""
 
     @property
     def mid(self) -> float:
@@ -201,11 +206,21 @@ class KabuAdapter:
         bid_sign = str(raw.get("AskSign") or "")
         ask_sign = str(raw.get("BidSign") or "")
 
-        ts_ns = _to_ns(
-            raw.get("CurrentPriceTime")
-            or raw.get("BidTime")
-            or raw.get("AskTime")
-        )
+        current_ts_ns = _to_ns(raw.get("CurrentPriceTime"))
+        bid_ts_ns = _to_ns(raw.get("BidTime"))
+        ask_ts_ns = _to_ns(raw.get("AskTime"))
+        if bid_ts_ns >= ask_ts_ns and bid_ts_ns >= current_ts_ns and bid_ts_ns > 0:
+            ts_ns = bid_ts_ns
+            ts_source = "bid_time"
+        elif ask_ts_ns >= bid_ts_ns and ask_ts_ns >= current_ts_ns and ask_ts_ns > 0:
+            ts_ns = ask_ts_ns
+            ts_source = "ask_time"
+        elif current_ts_ns > 0:
+            ts_ns = current_ts_ns
+            ts_source = "current_price_time"
+        else:
+            ts_ns = time.time_ns()
+            ts_source = "local_now_fallback"
         volume = _parse_int(raw.get("TradingVolume"))
 
         out_of_order = bool(
@@ -241,6 +256,10 @@ class KabuAdapter:
             out_of_order=out_of_order,
             bid_sign=bid_sign,
             ask_sign=ask_sign,
+            bid_ts_ns=bid_ts_ns,
+            ask_ts_ns=ask_ts_ns,
+            current_ts_ns=current_ts_ns,
+            ts_source=ts_source,
         )
         if not snapshot.valid:
             return None
@@ -632,6 +651,12 @@ class KabuWebSocket:
         self._snapshots: dict[str, BoardSnapshot] = {}
         self._volumes: dict[str, int] = {}
         self._last_trade_price: dict[str, float] = {}
+        self._last_latency_warn_ns: dict[str, int] = {}
+        self._latency_warn_interval_ns = 2_000_000_000  # 2s per symbol
+        self._latency_samples: dict[str, deque[float]] = {}
+        self._latency_sample_limit = 512
+        self._last_latency_stats_ns: dict[str, int] = {}
+        self._latency_stats_interval_ns = 30_000_000_000  # 30s
 
     async def run(self) -> None:
         import websockets
@@ -677,8 +702,8 @@ class KabuWebSocket:
 
     async def _connect(self, websockets_module: Any) -> Any:
         kwargs: dict[str, Any] = {
-            "ping_interval": 20,
-            "ping_timeout": 10,
+            "ping_interval": 25,
+            "ping_timeout": 30,
             "max_size": 2**20,
         }
         if self._api_token:
@@ -719,8 +744,34 @@ class KabuWebSocket:
             return
 
         latency_ms = max(0.0, (recv_ns - snapshot.ts_ns) / 1_000_000)
-        if latency_ms > 500:
-            logger.warning("market data latency %.1fms for %s", latency_ms, symbol)
+        bid_latency_ms = (
+            max(0.0, (recv_ns - snapshot.bid_ts_ns) / 1_000_000)
+            if snapshot.bid_ts_ns > 0
+            else -1.0
+        )
+        ask_latency_ms = (
+            max(0.0, (recv_ns - snapshot.ask_ts_ns) / 1_000_000)
+            if snapshot.ask_ts_ns > 0
+            else -1.0
+        )
+        current_latency_ms = (
+            max(0.0, (recv_ns - snapshot.current_ts_ns) / 1_000_000)
+            if snapshot.current_ts_ns > 0
+            else -1.0
+        )
+        self._record_latency(symbol, latency_ms)
+
+        if latency_ms > 500 and self._should_log_latency_warn(symbol, recv_ns):
+            logger.warning(
+                "market data latency %.1fms for %s (source=%s bid=%.1fms ask=%.1fms current=%.1fms)",
+                latency_ms,
+                symbol,
+                snapshot.ts_source,
+                bid_latency_ms,
+                ask_latency_ms,
+                current_latency_ms,
+            )
+        self._maybe_log_latency_stats(symbol, recv_ns)
 
         prev_volume = self._volumes.get(symbol, snapshot.volume)
         self._snapshots[symbol] = snapshot
@@ -737,3 +788,61 @@ class KabuWebSocket:
             if trade is not None:
                 self._last_trade_price[symbol] = trade.price
                 self._on_trade(trade)
+
+    def _should_log_latency_warn(self, symbol: str, now_ns: int) -> bool:
+        last = self._last_latency_warn_ns.get(symbol, 0)
+        if now_ns - last < self._latency_warn_interval_ns:
+            return False
+        self._last_latency_warn_ns[symbol] = now_ns
+        return True
+
+    def _record_latency(self, symbol: str, latency_ms: float) -> None:
+        buf = self._latency_samples.get(symbol)
+        if buf is None:
+            buf = deque()
+            self._latency_samples[symbol] = buf
+        buf.append(latency_ms)
+        while len(buf) > self._latency_sample_limit:
+            buf.popleft()
+
+    def _maybe_log_latency_stats(self, symbol: str, now_ns: int) -> None:
+        last = self._last_latency_stats_ns.get(symbol, 0)
+        if now_ns - last < self._latency_stats_interval_ns:
+            return
+        stats = self.get_latency_stats(symbol)
+        if stats is None:
+            return
+        self._last_latency_stats_ns[symbol] = now_ns
+        logger.info(
+            "latency stats symbol=%s samples=%d p50=%.1fms p90=%.1fms p99=%.1fms max=%.1fms",
+            symbol,
+            stats["samples"],
+            stats["p50_ms"],
+            stats["p90_ms"],
+            stats["p99_ms"],
+            stats["max_ms"],
+        )
+
+    def get_latency_stats(self, symbol: str) -> dict[str, float | int] | None:
+        buf = self._latency_samples.get(symbol)
+        if not buf:
+            return None
+        values = sorted(buf)
+        size = len(values)
+        return {
+            "samples": size,
+            "p50_ms": self._percentile(values, 0.50),
+            "p90_ms": self._percentile(values, 0.90),
+            "p99_ms": self._percentile(values, 0.99),
+            "max_ms": values[-1],
+        }
+
+    @staticmethod
+    def _percentile(values: list[float], q: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        idx = int(round((len(values) - 1) * q))
+        idx = max(0, min(idx, len(values) - 1))
+        return values[idx]

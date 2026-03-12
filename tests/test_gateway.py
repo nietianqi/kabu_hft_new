@@ -63,6 +63,31 @@ class GatewayAdapterTests(unittest.TestCase):
             int(datetime.fromisoformat("2026-03-11T09:00:02+09:00").timestamp() * 1_000_000_000),
         )
 
+    def test_board_timestamp_prefers_bid_or_ask_time_over_current_price_time(self) -> None:
+        raw = {
+            "Symbol": "9984",
+            "Exchange": 1,
+            "AskPrice": 9980,
+            "AskQty": 400,
+            "BidPrice": 9990,
+            "BidQty": 500,
+            "Buy1": {"Price": 9980, "Qty": 400},
+            "Sell1": {"Price": 9990, "Qty": 500},
+            "CurrentPrice": 9985,
+            "CurrentPriceTime": "2026-03-11T09:00:00+09:00",
+            "BidTime": "2026-03-11T09:00:01+09:00",
+            "AskTime": "2026-03-11T09:00:00.500000+09:00",
+            "TradingVolume": 1000,
+        }
+        snapshot = KabuAdapter.board(raw, None)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.ts_source, "bid_time")
+        self.assertEqual(
+            snapshot.ts_ns,
+            int(datetime.fromisoformat("2026-03-11T09:00:01+09:00").timestamp() * 1_000_000_000),
+        )
+
 
 class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_sendorder_uses_stored_password(self) -> None:
