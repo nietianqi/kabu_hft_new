@@ -152,6 +152,15 @@ class HFTStrategy:
         self.signal_count += 1
         self.latest_item = (snapshot, signal, now_ns)
         self.signal_event.set()
+        if self.board_count % 1000 == 0:
+            logger.debug(
+                "heartbeat symbol=%s boards=%d signals=%d trades=%d state=%s",
+                self.config.symbol,
+                self.board_count,
+                self.signal_count,
+                self.trade_count,
+                self.execution.state.value,
+            )
 
     def on_trade(self, trade: TradePrint) -> None:
         if not self.started or trade.symbol != self.config.symbol:
@@ -246,7 +255,9 @@ class HFTStrategy:
                 should_cancel = True
                 reason = "fair_drift"
             if should_cancel and self.execution.can_requote(now_ns):
-                await self.execution.cancel_working(reason=reason)
+                cancelled = await self.execution.cancel_working(reason=reason)
+                if cancelled:
+                    self.execution.consume_requote(now_ns)
             return
 
         if state is ExecutionState.CLOSING:
@@ -330,7 +341,8 @@ class HFTStrategy:
 
         inventory_ratio = 0.0
         if self.config.max_inventory_qty > 0:
-            signed_inventory = self.execution.inventory.side * self.execution.inventory.qty
+            inv = self.execution.inventory
+            signed_inventory = inv.side * inv.qty if inv.side != 0 else 0
             inventory_ratio = signed_inventory / self.config.max_inventory_qty
         skew_multiplier = 1.0
         if abs(inventory_ratio) >= 0.66:

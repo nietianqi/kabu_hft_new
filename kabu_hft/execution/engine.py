@@ -83,14 +83,19 @@ class RequoteBudget:
         self.max_requotes_per_minute = max_requotes_per_minute
         self.timestamps: deque[int] = deque()
 
-    def allow(self, now_ns: int) -> bool:
+    def _trim(self, now_ns: int) -> None:
         window_ns = 60 * 1_000_000_000
         while self.timestamps and now_ns - self.timestamps[0] > window_ns:
             self.timestamps.popleft()
-        if len(self.timestamps) >= self.max_requotes_per_minute:
-            return False
+
+    def allow(self, now_ns: int) -> bool:
+        """Check only — does NOT consume budget. Call consume() after successful send."""
+        self._trim(now_ns)
+        return len(self.timestamps) < self.max_requotes_per_minute
+
+    def consume(self, now_ns: int) -> None:
+        """Record a requote usage. Call only after a cancel+re-send succeeds."""
         self.timestamps.append(now_ns)
-        return True
 
 
 class PriceSelector:
@@ -475,7 +480,12 @@ class ExecutionController:
         return True
 
     def can_requote(self, now_ns: int) -> bool:
+        """Check if requote budget allows another cancel+re-place. Does NOT consume budget."""
         return self.requotes.allow(now_ns)
+
+    def consume_requote(self, now_ns: int) -> None:
+        """Record one requote usage. Call after cancel_working() returns True."""
+        self.requotes.consume(now_ns)
 
     async def check_timeout(self, now_ns: int) -> bool:
         if self.working_order is None:

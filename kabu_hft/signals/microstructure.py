@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass
+
+logger = logging.getLogger("kabu.signals")
 
 from kabu_hft.config import SignalWeights
 from kabu_hft.gateway import BoardSnapshot, TradePrint
@@ -124,8 +127,17 @@ class TapeOFISignal:
         self.events: deque[tuple[int, int, int]] = deque()
         self.buy_volume = 0
         self.sell_volume = 0
+        self._last_ts_ns: int = 0
 
     def on_trade(self, trade: TradePrint) -> float:
+        if self._last_ts_ns > 0 and trade.ts_ns < self._last_ts_ns:
+            logger.debug(
+                "tape_ofi out-of-order skipped ts_ns=%d last=%d",
+                trade.ts_ns,
+                self._last_ts_ns,
+            )
+            return self.current
+        self._last_ts_ns = trade.ts_ns
         self.events.append((trade.ts_ns, trade.size if trade.side > 0 else 0, trade.size if trade.side < 0 else 0))
         self.buy_volume += trade.size if trade.side > 0 else 0
         self.sell_volume += trade.size if trade.side < 0 else 0
