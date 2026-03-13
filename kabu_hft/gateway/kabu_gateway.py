@@ -476,7 +476,9 @@ class KabuAdapter:
     def position_lot(raw: dict[str, Any]) -> PositionLot | None:
         hold_id = str(raw.get("ExecutionID") or raw.get("HoldID") or "")
         symbol = str(raw.get("Symbol") or "")
-        qty = _parse_int(raw.get("HoldQty") or raw.get("LeavesQty") or raw.get("Qty"))
+        _hold = raw.get("HoldQty")
+        _leaves = raw.get("LeavesQty")
+        qty = _parse_int(_hold if _hold is not None else (_leaves if _leaves is not None else raw.get("Qty")))
         if not hold_id or not symbol or qty <= 0:
             return None
         return PositionLot(

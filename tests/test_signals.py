@@ -28,7 +28,7 @@ class SignalStackTests(unittest.TestCase):
 
         prev = None
         last_signal = None
-        for index in range(30):
+        for index in range(60):
             snapshot = BoardSnapshot(
                 symbol="9984",
                 exchange=1,

@@ -22,15 +22,16 @@ def reconcile_order_state(
     issue: ReconciliationIssue | None = None
     broker_status = broker.status
 
-    if broker_status == "filled":
-        local.status = OrderStatus.FILLED
-    elif broker_status == "cancelled":
-        local.status = OrderStatus.CANCELED
-    elif broker_status == "partial":
-        local.status = OrderStatus.PARTIALLY_FILLED
-    else:
-        if local.status == OrderStatus.NEW_PENDING:
-            local.status = OrderStatus.WORKING
+    if not local.is_final:
+        if broker_status == "filled":
+            local.status = OrderStatus.FILLED
+        elif broker_status == "cancelled":
+            local.status = OrderStatus.CANCELED
+        elif broker_status == "partial":
+            local.status = OrderStatus.PARTIALLY_FILLED
+        else:
+            if local.status == OrderStatus.NEW_PENDING:
+                local.status = OrderStatus.WORKING
 
     if broker.cum_qty < local.cum_qty:
         issue = ReconciliationIssue(

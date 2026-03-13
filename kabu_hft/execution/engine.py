@@ -574,7 +574,16 @@ class ExecutionController:
         if self.working_order is None or snapshot.order_id != self.working_order.order_id:
             return
 
-        new_qty = max(snapshot.cum_qty - self.working_order.cum_qty, 0)
+        new_qty = snapshot.cum_qty - self.working_order.cum_qty
+        if new_qty < 0:
+            logger.warning(
+                "cum_qty regression symbol=%s order_id=%s local=%d broker=%d; skipping fill",
+                self.symbol,
+                self.working_order.order_id,
+                self.working_order.cum_qty,
+                snapshot.cum_qty,
+            )
+            new_qty = 0
         if new_qty > 0:
             fill_price = self._incremental_fill_price(
                 prev_qty=self.working_order.cum_qty,
@@ -713,12 +722,14 @@ class ExecutionController:
             self.inventory.qty = max(0, self.inventory.qty - qty)
             if self.inventory.qty == 0:
                 exit_price = self.inventory.exit_value / max(self.inventory.exit_qty, 1)
-                realized_pnl = self.inventory.side * (exit_price - self.inventory.avg_price) * self.inventory.entry_qty
+                # 使用 exit_qty（实际成交平仓量）而非 entry_qty，防止 _sync_inventory_from_api
+                # 修正持仓数量后 entry_qty 与实际平仓量不一致导致 P&L 失真。
+                realized_pnl = self.inventory.side * (exit_price - self.inventory.avg_price) * self.inventory.exit_qty
                 self.closed_trades.append(
                     RoundTrip(
                         symbol=self.symbol,
                         side=self.inventory.side,
-                        qty=self.inventory.entry_qty,
+                        qty=self.inventory.exit_qty,
                         entry_price=self.inventory.avg_price,
                         exit_price=exit_price,
                         entry_ts_ns=self.inventory.opened_ts_ns,
