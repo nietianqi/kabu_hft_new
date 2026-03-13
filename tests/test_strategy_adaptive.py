@@ -66,14 +66,11 @@ class StrategyAdaptiveTests(unittest.TestCase):
 
 
 class StrategyExitPolicyTests(unittest.IsolatedAsyncioTestCase):
-    def _make_strategy(self, *, disable_stop_loss: bool) -> HFTStrategy:
+    def _make_strategy(self) -> HFTStrategy:
         app_cfg = load_config(None)
         cfg = app_cfg.strategies[0]
         cfg.tick_size = 1.0
         cfg.take_profit_ticks = 1.0
-        cfg.take_profit_min_hold_ms = 0
-        cfg.stop_loss_ticks = 1.0
-        cfg.disable_stop_loss = disable_stop_loss
         strategy = HFTStrategy(
             config=cfg,
             order_profile=app_cfg.order_profile,
@@ -91,40 +88,49 @@ class StrategyExitPolicyTests(unittest.IsolatedAsyncioTestCase):
         strategy.execution.inventory.opened_ts_ns = opened_ts_ns
         strategy.execution.inventory.entry_qty = qty
 
-    async def test_take_profit_closes_open_position(self) -> None:
-        strategy = self._make_strategy(disable_stop_loss=False)
+    async def test_open_position_places_plus_one_tick_take_profit_quote(self) -> None:
+        strategy = self._make_strategy()
         self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
         strategy.execution.close = AsyncMock(return_value=True)
-        snapshot = _snapshot(bid=101.0, ask=102.0, ts_ns=2_000_000_000)
+        strategy.risk.must_close = lambda **_: (False, "")
+        snapshot = _snapshot(bid=99.0, ask=100.0, ts_ns=2_000_000_000)
 
         await strategy._process_signal(snapshot, _signal(0.20), snapshot.ts_ns)
 
         strategy.execution.close.assert_awaited_once()
         kwargs = strategy.execution.close.await_args.kwargs
-        self.assertEqual(kwargs["reason"], "take_profit")
-        self.assertTrue(kwargs["force"])
+        self.assertEqual(kwargs["reason"], "take_profit_quote")
+        self.assertFalse(kwargs["force"])
+        self.assertEqual(kwargs["target_price"], 101.0)
 
-    async def test_disable_stop_loss_keeps_position_open(self) -> None:
-        strategy = self._make_strategy(disable_stop_loss=True)
+    async def test_must_close_signal_is_ignored_while_losing(self) -> None:
+        strategy = self._make_strategy()
         self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
         strategy.execution.close = AsyncMock(return_value=True)
-        snapshot = _snapshot(bid=99.0, ask=100.0, ts_ns=2_000_000_000)
-
-        await strategy._process_signal(snapshot, _signal(0.10), snapshot.ts_ns)
-
-        strategy.execution.close.assert_not_awaited()
-
-    async def test_enabled_stop_loss_closes_loser(self) -> None:
-        strategy = self._make_strategy(disable_stop_loss=False)
-        self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
-        strategy.execution.close = AsyncMock(return_value=True)
+        strategy.risk.must_close = lambda **_: (True, "max_hold_time")
         snapshot = _snapshot(bid=99.0, ask=100.0, ts_ns=2_000_000_000)
 
         await strategy._process_signal(snapshot, _signal(0.10), snapshot.ts_ns)
 
         strategy.execution.close.assert_awaited_once()
         kwargs = strategy.execution.close.await_args.kwargs
-        self.assertEqual(kwargs["reason"], "stop_loss")
+        self.assertEqual(kwargs["reason"], "take_profit_quote")
+        self.assertFalse(kwargs["force"])
+        self.assertEqual(kwargs["target_price"], 101.0)
+
+    async def test_must_close_force_exits_when_position_is_profitable(self) -> None:
+        strategy = self._make_strategy()
+        self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
+        strategy.execution.close = AsyncMock(return_value=True)
+        strategy.risk.must_close = lambda **_: (True, "session_end")
+        snapshot = _snapshot(bid=101.0, ask=102.0, ts_ns=2_000_000_000)
+
+        await strategy._process_signal(snapshot, _signal(0.10), snapshot.ts_ns)
+
+        strategy.execution.close.assert_awaited_once()
+        kwargs = strategy.execution.close.await_args.kwargs
+        self.assertEqual(kwargs["reason"], "session_end")
+        self.assertTrue(kwargs["force"])
 
 
 if __name__ == "__main__":

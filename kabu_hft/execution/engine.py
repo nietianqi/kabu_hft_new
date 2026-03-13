@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -428,6 +429,7 @@ class ExecutionController:
         score: float,
         reason: str,
         force: bool,
+        target_price: float | None = None,
     ) -> bool:
         if self.inventory.qty <= 0 or self.working_order is not None:
             return False
@@ -438,6 +440,13 @@ class ExecutionController:
             score=score,
             force=force,
         )
+        if target_price is not None and not decision.is_market:
+            exit_side = -self.inventory.side
+            decision = PriceDecision(
+                price=self._align_price_to_tick(target_price, side=exit_side),
+                is_market=False,
+                edge_ticks=decision.edge_ticks,
+            )
         qty = self.inventory.qty
         self.stats["close_attempts"] += 1
         now_ns = self._clock.time_ns()
@@ -655,6 +664,20 @@ class ExecutionController:
     def _next_paper_order_id(self) -> str:
         self.paper_order_counter += 1
         return f"PAPER-{self.symbol}-{self.paper_order_counter}"
+
+    def _align_price_to_tick(self, price: float, *, side: int) -> float:
+        """Snap price to valid tick grid.
+
+        side > 0 (buy): floor to avoid paying more than intended.
+        side < 0 (sell): ceil to avoid selling below intended target.
+        """
+        tick = max(self.selector.tick_size, 1e-9)
+        steps = price / tick
+        if side > 0:
+            snapped_steps = math.floor(steps + 1e-9)
+        else:
+            snapped_steps = math.ceil(steps - 1e-9)
+        return max(snapped_steps * tick, tick)
 
     def _paper_fill(self, *, limit_price: float, reason: str) -> None:
         if self.working_order is None:
