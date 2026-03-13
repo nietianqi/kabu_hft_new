@@ -76,8 +76,31 @@
       "exchange": 1,
       "tick_size": 0.5,
       "base_qty": 100,
-      "max_qty": 200,
-      "max_inventory_qty": 200,
+      "fixed_qty": 100,
+      "max_qty": 100,
+      "max_inventory_qty": 100,
+      "max_notional": 1000000,
+      "daily_loss_limit": -30000
+    },
+       {
+      "symbol": "4680",
+      "exchange": 1,
+      "tick_size": 0.1,
+      "base_qty": 100,
+      "fixed_qty": 100,
+      "max_qty": 100,
+      "max_inventory_qty": 100,
+      "max_notional": 1000000,
+      "daily_loss_limit": -30000
+    },
+       {
+      "symbol": "9616",
+      "exchange": 1,
+      "tick_size": 0.5,
+      "base_qty": 100,
+      "fixed_qty": 100,
+      "max_qty": 100,
+      "max_inventory_qty": 100,
       "max_notional": 1000000,
       "daily_loss_limit": -30000
     }

@@ -8,12 +8,19 @@ from kabu_hft.risk import RiskGuard
 JST = timezone(timedelta(hours=9))
 
 
-def _make_guard(*, stale_quote_ms: int = 1500, daily_loss_limit: float = -10_000) -> RiskGuard:
+def _make_guard(
+    *,
+    stale_quote_ms: int = 1500,
+    daily_loss_limit: float = -10_000,
+    max_notional: float = 3_000_000,
+    fixed_qty: int | None = None,
+) -> RiskGuard:
     return RiskGuard(
         base_qty=100,
+        fixed_qty=fixed_qty,
         max_qty=300,
         max_inventory_qty=300,
-        max_notional=3_000_000,
+        max_notional=max_notional,
         daily_loss_limit=daily_loss_limit,
         consecutive_loss_limit=3,
         cooling_seconds=60,
@@ -45,6 +52,23 @@ def _make_snapshot(ts_ns: int) -> BoardSnapshot:
 
 
 class RiskGuardTests(unittest.TestCase):
+    def test_fixed_qty_is_used_for_entry_size(self) -> None:
+        guard = _make_guard(fixed_qty=100)
+        now_ns = time.time_ns()
+        snapshot = _make_snapshot(now_ns)
+        guard.update_vol(snapshot)
+
+        qty = guard.calc_qty(signal_strength=2.0, mid=snapshot.mid, inventory_qty=0)
+        self.assertEqual(qty, 100)
+
+    def test_fixed_qty_returns_zero_if_notional_limit_too_small(self) -> None:
+        guard = _make_guard(fixed_qty=100, max_notional=9_000)
+        now_ns = time.time_ns()
+        snapshot = _make_snapshot(now_ns)
+
+        qty = guard.calc_qty(signal_strength=2.0, mid=snapshot.mid, inventory_qty=0)
+        self.assertEqual(qty, 0)
+
     def test_can_open_blocks_stale_quote(self) -> None:
         guard = _make_guard(stale_quote_ms=100)
         now_ns = time.time_ns()

@@ -139,11 +139,19 @@ class PnLTracker:
 
 
 class PositionSizer:
-    def __init__(self, base_qty: int, max_qty: int, max_inventory_qty: int, max_notional: float):
+    def __init__(
+        self,
+        base_qty: int,
+        max_qty: int,
+        max_inventory_qty: int,
+        max_notional: float,
+        fixed_qty: int | None = None,
+    ):
         self.base_qty = max(base_qty, 1)
         self.max_qty = max(max_qty, self.base_qty)
         self.max_inventory_qty = max(max_inventory_qty, self.base_qty)
         self.max_notional = max_notional
+        self.fixed_qty = fixed_qty if fixed_qty is not None and fixed_qty > 0 else None
 
     def calc_qty(
         self,
@@ -155,6 +163,14 @@ class PositionSizer:
         daily_loss_limit: float,
         daily_pnl: float,
     ) -> int:
+        if self.fixed_qty is not None:
+            qty = self.fixed_qty
+            if qty > max(self.max_inventory_qty - inventory_qty, 0):
+                return 0
+            if self.max_notional > 0 and mid > 0 and qty * mid > self.max_notional:
+                return 0
+            return qty
+
         qty = self.base_qty
         if atr > 2.5 * max(mid * 0.001, 1.0):
             qty = max(self.base_qty // 2, 1)
@@ -178,6 +194,7 @@ class RiskGuard:
         self,
         *,
         base_qty: int,
+        fixed_qty: int | None = None,
         max_qty: int,
         max_inventory_qty: int,
         max_notional: float,
@@ -195,7 +212,13 @@ class RiskGuard:
         self.session = SessionGuard()
         self.pnl = PnLTracker(daily_loss_limit, consecutive_loss_limit, cooling_seconds, max_hold_seconds, clock=clock)
         self.vol = VolatilityEstimator()
-        self.sizer = PositionSizer(base_qty, max_qty, max_inventory_qty, max_notional)
+        self.sizer = PositionSizer(
+            base_qty=base_qty,
+            max_qty=max_qty,
+            max_inventory_qty=max_inventory_qty,
+            max_notional=max_notional,
+            fixed_qty=fixed_qty,
+        )
         self.max_spread = max_spread_ticks * tick_size
         self.stale_quote_ns = stale_quote_ms * 1_000_000
         self.tick_size = tick_size

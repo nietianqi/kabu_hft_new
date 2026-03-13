@@ -44,6 +44,7 @@ class HFTStrategy:
         )
         self.risk = RiskGuard(
             base_qty=config.base_qty,
+            fixed_qty=config.fixed_qty,
             max_qty=config.max_qty,
             max_inventory_qty=config.max_inventory_qty,
             max_notional=config.max_notional,

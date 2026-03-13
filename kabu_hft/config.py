@@ -82,6 +82,7 @@ DEFAULT_CONFIG: dict = {
             "exchange": 1,
             "tick_size": 50.0,
             "base_qty": 100,
+            "fixed_qty": None,
             "max_qty": 300,
             "max_inventory_qty": 300,
             "max_notional": 3_000_000,
@@ -92,6 +93,7 @@ DEFAULT_CONFIG: dict = {
             "exchange": 1,
             "tick_size": 5.0,
             "base_qty": 100,
+            "fixed_qty": None,
             "max_qty": 300,
             "max_inventory_qty": 300,
             "max_notional": 3_000_000,
@@ -173,6 +175,7 @@ class StrategyConfig:
     exchange: int
     tick_size: float
     base_qty: int
+    fixed_qty: int | None
     max_qty: int
     max_inventory_qty: int
     max_notional: float
@@ -244,12 +247,15 @@ def load_config(path: str | Path | None) -> AppConfig:
     strategies: list[StrategyConfig] = []
     for raw_symbol in payload.get("symbols", []):
         merged = _deep_merge(global_cfg, raw_symbol)
+        raw_fixed_qty = merged.get("fixed_qty")
+        fixed_qty = int(raw_fixed_qty) if raw_fixed_qty is not None else None
         strategies.append(
             StrategyConfig(
                 symbol=str(raw_symbol["symbol"]),
                 exchange=int(raw_symbol.get("exchange", 1)),
                 tick_size=float(raw_symbol["tick_size"]),
                 base_qty=int(raw_symbol.get("base_qty", 100)),
+                fixed_qty=fixed_qty if fixed_qty and fixed_qty > 0 else None,
                 max_qty=int(raw_symbol.get("max_qty", raw_symbol.get("base_qty", 100))),
                 max_inventory_qty=int(raw_symbol.get("max_inventory_qty", raw_symbol.get("max_qty", raw_symbol.get("base_qty", 100)))),
                 max_notional=float(raw_symbol.get("max_notional", 0.0)),
