@@ -280,6 +280,7 @@ class ExecutionController:
         self.paper_order_counter = 0
         self.paper_last_fill_reason = ""
         self.has_stranded_partial: bool = False
+        self._exit_blocked_until_ns: int = 0
         self._order_ledger = OrderLedger()
         self.stats = {
             "sent_orders": 0,
@@ -431,7 +432,10 @@ class ExecutionController:
         force: bool,
         target_price: float | None = None,
     ) -> bool:
+        now_ns = self._clock.time_ns()
         if self.inventory.qty <= 0 or self.working_order is not None:
+            return False
+        if now_ns < self._exit_blocked_until_ns:
             return False
 
         decision = self.selector.exit(
@@ -449,7 +453,6 @@ class ExecutionController:
             )
         qty = self.inventory.qty
         self.stats["close_attempts"] += 1
-        now_ns = self._clock.time_ns()
         if self.dry_run:
             order_id = self._next_paper_order_id()
         else:
@@ -470,6 +473,16 @@ class ExecutionController:
                     # 本地 inventory 与 broker 端出现偏差。
                     # 从 API 获取实际持仓并同步，防止无限循环。
                     await self._sync_inventory_from_api()
+                    return False
+                error_code = _extract_error_code(exc.payload)
+                if error_code == 8:
+                    await self._sync_inventory_from_api()
+                    self._exit_blocked_until_ns = now_ns + 15_000_000_000  # 15s
+                    logger.warning(
+                        "exit rejected symbol=%s code=8 (locked lot / margin spec error); "
+                        "backing off 15s — check for pending manual orders",
+                        self.symbol,
+                    )
                     return False
                 raise
             order_id = str(response.get("OrderId") or response.get("ID") or "")

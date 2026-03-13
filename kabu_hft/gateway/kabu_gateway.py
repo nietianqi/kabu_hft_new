@@ -258,7 +258,9 @@ class PositionLot:
     exchange: int
     side: int
     qty: int
+    closable_qty: int  # ClosableQty from API — shares not locked in pending orders
     price: float
+    margin_trade_type: int = 0
 
 
 class KabuApiError(RuntimeError):
@@ -474,20 +476,25 @@ class KabuAdapter:
 
     @staticmethod
     def position_lot(raw: dict[str, Any]) -> PositionLot | None:
-        hold_id = str(raw.get("ExecutionID") or raw.get("HoldID") or "")
+        # Prefer broker-native HoldID when available; fall back to ExecutionID for older responses.
+        hold_id = str(raw.get("HoldID") or raw.get("ExecutionID") or "")
         symbol = str(raw.get("Symbol") or "")
         _hold = raw.get("HoldQty")
         _leaves = raw.get("LeavesQty")
         qty = _parse_int(_hold if _hold is not None else (_leaves if _leaves is not None else raw.get("Qty")))
         if not hold_id or not symbol or qty <= 0:
             return None
+        closable = raw.get("ClosableQty")
+        closable_qty = _parse_int(closable) if closable is not None else qty
         return PositionLot(
             hold_id=hold_id,
             symbol=symbol,
             exchange=_parse_int(raw.get("Exchange"), 1),
             side=_internal_side(raw.get("Side")),
             qty=qty,
+            closable_qty=closable_qty,
             price=_parse_float(raw.get("Price") or raw.get("ExecutionPrice")),
+            margin_trade_type=_parse_int(raw.get("MarginTradeType"), 0),
         )
 
 
@@ -682,19 +689,69 @@ class KabuRestClient:
         }
 
         if _is_margin_mode(profile.mode):
+            close_positions, selected_positions = await self._build_close_positions(
+                symbol=symbol,
+                exchange=exchange,
+                position_side=position_side,
+                qty=qty,
+                strict_exchange=True,
+            )
+            margin_trade_type = self._resolve_margin_trade_type(
+                default_trade_type=profile.margin_trade_type,
+                selected_positions=selected_positions,
+            )
             body.update(
                 {
                     "CashMargin": 3,
-                    "MarginTradeType": profile.margin_trade_type,
+                    "MarginTradeType": margin_trade_type,
                     "DelivType": profile.margin_close_deliv_type,
-                    "ClosePositions": await self._build_close_positions(
-                        symbol=symbol,
-                        exchange=exchange,
-                        position_side=position_side,
-                        qty=qty,
-                    ),
+                    "ClosePositions": close_positions,
                 }
             )
+
+            try:
+                return await self._sendorder_with_exchange_retry(
+                    symbol=symbol,
+                    exchange=exchange,
+                    body=body,
+                )
+            except KabuApiError as exc:
+                error_code = _extract_error_code(exc.payload)
+                # code=8: "invalid settlement specification".
+                # Retry once by reloading positions and re-aligning exchange/trade-type from broker truth.
+                if error_code != 8:
+                    raise
+                retry_close_positions, retry_selected = await self._build_close_positions(
+                    symbol=symbol,
+                    exchange=exchange,
+                    position_side=position_side,
+                    qty=qty,
+                    strict_exchange=False,
+                )
+                retry_exchange = exchange
+                exchanges = {position.exchange for position in retry_selected if position.exchange > 0}
+                if len(exchanges) == 1:
+                    retry_exchange = next(iter(exchanges))
+                retry_margin_trade_type = self._resolve_margin_trade_type(
+                    default_trade_type=profile.margin_trade_type,
+                    selected_positions=retry_selected,
+                )
+                retry_body = dict(body)
+                retry_body["Exchange"] = retry_exchange
+                retry_body["MarginTradeType"] = retry_margin_trade_type
+                retry_body["ClosePositions"] = retry_close_positions
+                logger.warning(
+                    "exit sendorder rejected code=8 symbol=%s; retrying with exchange=%s margin_trade_type=%s hold_ids=%s",
+                    symbol,
+                    retry_exchange,
+                    retry_margin_trade_type,
+                    [position.hold_id for position in retry_selected],
+                )
+                return await self._sendorder_with_exchange_retry(
+                    symbol=symbol,
+                    exchange=retry_exchange,
+                    body=retry_body,
+                )
         else:
             body.update(
                 {
@@ -703,12 +760,11 @@ class KabuRestClient:
                     "FundType": profile.cash_buy_fund_type if broker_side > 0 else profile.cash_sell_fund_type,
                 }
             )
-
-        return await self._sendorder_with_exchange_retry(
-            symbol=symbol,
-            exchange=exchange,
-            body=body,
-        )
+            return await self._sendorder_with_exchange_retry(
+                symbol=symbol,
+                exchange=exchange,
+                body=body,
+            )
 
     async def _build_close_positions(
         self,
@@ -717,21 +773,49 @@ class KabuRestClient:
         exchange: int,
         position_side: int,
         qty: int,
-    ) -> list[dict[str, Any]]:
+        strict_exchange: bool = True,
+    ) -> tuple[list[dict[str, Any]], list[PositionLot]]:
         positions = [KabuAdapter.position_lot(raw) for raw in await self.get_positions(symbol)]
-        usable_positions = [
+        same_side_positions = [
             pos
             for pos in positions
             if pos
             and pos.side == position_side
-            and pos.exchange == exchange
+            and pos.closable_qty > 0  # skip lots locked in pending repayment orders
         ]
+        exchange_matched_positions = [pos for pos in same_side_positions if pos.exchange == exchange]
+
+        if exchange_matched_positions:
+            usable_positions = exchange_matched_positions
+        elif strict_exchange:
+            usable_positions = []
+        else:
+            unique_exchanges = {pos.exchange for pos in same_side_positions if pos.exchange > 0}
+            if len(unique_exchanges) > 1:
+                raise KabuApiError(
+                    f"ambiguous inventory exchange for close {symbol}: {sorted(unique_exchanges)}",
+                    payload=[
+                        {
+                            "hold_id": position.hold_id,
+                            "symbol": position.symbol,
+                            "exchange": position.exchange,
+                            "side": position.side,
+                            "qty": position.qty,
+                            "price": position.price,
+                            "margin_trade_type": position.margin_trade_type,
+                        }
+                        for position in same_side_positions
+                    ],
+                )
+            usable_positions = same_side_positions
 
         remaining = qty
         close_positions: list[dict[str, Any]] = []
+        selected_positions: list[PositionLot] = []
         for position in usable_positions:
-            take_qty = min(position.qty, remaining)
+            take_qty = min(position.closable_qty, remaining)
             close_positions.append({"HoldID": position.hold_id, "Qty": take_qty})
+            selected_positions.append(position)
             remaining -= take_qty
             if remaining == 0:
                 break
@@ -747,11 +831,23 @@ class KabuRestClient:
                         "side": position.side,
                         "qty": position.qty,
                         "price": position.price,
+                        "margin_trade_type": position.margin_trade_type,
                     }
                     for position in usable_positions
                 ],
             )
-        return close_positions
+        return close_positions, selected_positions
+
+    @staticmethod
+    def _resolve_margin_trade_type(
+        *,
+        default_trade_type: int,
+        selected_positions: list[PositionLot],
+    ) -> int:
+        lot_trade_types = {position.margin_trade_type for position in selected_positions if position.margin_trade_type > 0}
+        if len(lot_trade_types) == 1:
+            return next(iter(lot_trade_types))
+        return default_trade_type
 
     async def _request_json(
         self,
