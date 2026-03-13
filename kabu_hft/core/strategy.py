@@ -193,16 +193,11 @@ class HFTStrategy:
         self._drain_completed_trades()
 
         # Handle stranded partial fill: entry was partially filled then cancelled.
-        # Force-close the residual inventory immediately before any other logic.
+        # With current policy we do not force a loss exit; clear the marker and
+        # let normal OPEN-state logic place/maintain take-profit quotes.
         if self.execution.has_stranded_partial and self.execution.state is ExecutionState.OPEN:
             self.execution.has_stranded_partial = False
-            await self.execution.close(
-                snapshot=snapshot,
-                score=0.0,
-                reason="stranded_partial_close",
-                force=True,
-            )
-            return
+            logger.info("stranded partial detected symbol=%s; switched to profit-only exit mode", self.config.symbol)
 
         now_dt = datetime.now(JST)
         score = signal.composite
@@ -271,34 +266,37 @@ class HFTStrategy:
             return
 
         if state is ExecutionState.CLOSING:
-            must_close, reason = self.risk.must_close(
-                open_ts_ns=self.execution.inventory.opened_ts_ns,
-                snapshot=snapshot,
-                now_ns=now_ns,
-                now_dt=now_dt,
-            )
-            if must_close and self.execution.working_age_ns(now_ns) > self.execution.min_order_lifetime_ns:
-                await self.execution.cancel_working(reason=reason)
+            # Keep exit quote resting. Do not loop-cancel close orders.
             return
 
         if state is ExecutionState.OPEN:
+            pnl_ticks = self._unrealized_ticks(snapshot)
             must_close, reason = self.risk.must_close(
                 open_ts_ns=self.execution.inventory.opened_ts_ns,
                 snapshot=snapshot,
                 now_ns=now_ns,
                 now_dt=now_dt,
             )
-            signal_reversed = (
-                self.execution.inventory.side > 0 and score <= -self.config.exit_threshold
-            ) or (
-                self.execution.inventory.side < 0 and score >= self.config.exit_threshold
-            )
-            if must_close or signal_reversed:
+            if must_close and pnl_ticks >= 0.0:
                 await self.execution.close(
                     snapshot=snapshot,
                     score=score,
-                    reason=reason or "signal_reverse",
-                    force=must_close or abs(score) >= self.config.strong_threshold,
+                    reason=reason or "risk_close",
+                    force=True,
+                )
+                return
+
+            # New close policy:
+            # 1) After entry fill, place a standing take-profit limit at +N ticks.
+            # 2) Do not close solely because position is losing.
+            target_price = self._take_profit_price()
+            if target_price > 0.0:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason="take_profit_quote",
+                    force=False,
+                    target_price=target_price,
                 )
             return
 
@@ -316,6 +314,36 @@ class HFTStrategy:
         if not allowed:
             return
 
+        quote_mode = self._mode_for_market(market_view.state)
+        queue_threshold = self._queue_threshold(snapshot, abs(score))
+        entry_decision = self.execution.preview_entry(
+            direction=direction,
+            snapshot=snapshot,
+            score=abs(score),
+            microprice=signal.microprice,
+            mode=quote_mode,
+            reservation_price=reservation_price,
+            queue_qty_threshold=queue_threshold,
+        )
+        open_allowed, open_reason = self._entry_filter(
+            snapshot=snapshot,
+            direction=direction,
+            entry_price=entry_decision.price,
+            is_market=entry_decision.is_market,
+            fair_price=fair_price,
+        )
+        if not open_allowed:
+            logger.debug(
+                "entry filtered symbol=%s reason=%s side=%+d spread=%.3f fair=%.3f entry=%.3f",
+                self.config.symbol,
+                open_reason,
+                direction,
+                snapshot.spread,
+                fair_price,
+                entry_decision.price,
+            )
+            return
+
         qty = self.risk.calc_qty(
             signal_strength=abs(score),
             mid=snapshot.mid,
@@ -324,8 +352,6 @@ class HFTStrategy:
         if qty <= 0:
             return
 
-        quote_mode = self._mode_for_market(market_view.state)
-        queue_threshold = self._queue_threshold(snapshot, abs(score))
         opened = await self.execution.open(
             direction=direction,
             qty=qty,
@@ -367,6 +393,57 @@ class HFTStrategy:
         if market_state is MarketState.ABNORMAL:
             return QuoteMode.CLOSE_ONLY
         return QuoteMode.PASSIVE_FAIR_VALUE
+
+    def _unrealized_ticks(self, snapshot: BoardSnapshot) -> float:
+        inv = self.execution.inventory
+        if inv.qty <= 0 or inv.side == 0 or inv.avg_price <= 0:
+            return 0.0
+        tick = max(self.config.tick_size, 1e-9)
+        if inv.side > 0:
+            return (snapshot.bid - inv.avg_price) / tick
+        return (inv.avg_price - snapshot.ask) / tick
+
+    def _take_profit_price(self) -> float:
+        inv = self.execution.inventory
+        if inv.qty <= 0 or inv.side == 0 or inv.avg_price <= 0:
+            return 0.0
+        tick = max(self.config.tick_size, 1e-9)
+        target_ticks = max(self.config.take_profit_ticks, 0.0)
+        if inv.side > 0:
+            return inv.avg_price + target_ticks * tick
+        return max(inv.avg_price - target_ticks * tick, tick)
+
+    def _entry_filter(
+        self,
+        *,
+        snapshot: BoardSnapshot,
+        direction: int,
+        entry_price: float,
+        is_market: bool,
+        fair_price: float,
+    ) -> tuple[bool, str]:
+        tick = max(self.config.tick_size, 1e-9)
+        target_ticks = max(self.config.take_profit_ticks, 0.0)
+        spread_ticks = snapshot.spread / tick if snapshot.spread > 0 else 0.0
+
+        if target_ticks > 0.0 and spread_ticks + 1e-9 < target_ticks:
+            return False, "spread_below_take_profit_target"
+        if is_market:
+            return False, "market_entry_rejected_for_scalp"
+
+        target_move = target_ticks * tick
+        if direction > 0:
+            if entry_price > snapshot.bid + 1e-9:
+                return False, "long_entry_chasing"
+            if target_ticks > 0.0 and fair_price + 1e-9 < entry_price + target_move:
+                return False, "fair_below_long_tp_target"
+            return True, "ok"
+
+        if entry_price < snapshot.ask - 1e-9:
+            return False, "short_entry_chasing"
+        if target_ticks > 0.0 and fair_price - 1e-9 > entry_price - target_move:
+            return False, "fair_above_short_tp_target"
+        return True, "ok"
 
     def _queue_threshold(self, snapshot: BoardSnapshot, signal_strength: float) -> int:
         base = max(self.config.queue_min_top_qty, 1)

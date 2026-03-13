@@ -107,8 +107,136 @@ class GatewayAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot.ts_ns, 0)
         self.assertEqual(snapshot.ts_source, "no_exchange_time")
 
+    def test_order_snapshot_does_not_infer_cum_qty_from_non_fill_details(self) -> None:
+        raw = {
+            "ID": "ORDER-1",
+            "State": 2,
+            "OrderState": 2,
+            "Side": "2",
+            "OrderQty": 100,
+            "CumQty": 0,
+            "Price": 1000.0,
+            "Details": [
+                {
+                    "RecType": 1,  # new/accepted record, not an execution fill
+                    "Qty": 100,
+                    "Price": 1000.0,
+                    "ExecutionID": "",
+                    "ExecutionDay": "2026-03-13T10:00:00+09:00",
+                }
+            ],
+        }
+        snapshot = KabuAdapter.order_snapshot(raw)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.cum_qty, 0)
+        self.assertEqual(snapshot.avg_fill_price, 0.0)
+        self.assertEqual(snapshot.status, "working")
+
+    def test_order_snapshot_uses_fill_details_for_average_price(self) -> None:
+        raw = {
+            "ID": "ORDER-2",
+            "State": 3,
+            "OrderState": 3,
+            "Side": "2",
+            "OrderQty": 100,
+            "CumQty": 80,
+            "Price": 1000.0,
+            "Details": [
+                {
+                    "RecType": 8,
+                    "Qty": 50,
+                    "Price": 1001.0,
+                    "ExecutionID": "E1",
+                    "ExecutionDay": "2026-03-13T10:00:00+09:00",
+                },
+                {
+                    "RecType": 8,
+                    "Qty": 30,
+                    "Price": 1002.0,
+                    "ExecutionID": "E2",
+                    "ExecutionDay": "2026-03-13T10:00:01+09:00",
+                },
+            ],
+        }
+        snapshot = KabuAdapter.order_snapshot(raw)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.cum_qty, 80)
+        self.assertAlmostEqual(snapshot.avg_fill_price, (50 * 1001.0 + 30 * 1002.0) / 80)
+        self.assertGreater(snapshot.fill_ts_ns, 0)
+
 
 class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_json_does_not_retry_order_mutation_500(self) -> None:
+        class _Response:
+            def __init__(self, status: int, payload: dict):
+                self.status = status
+                self._payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self) -> str:
+                return json.dumps(self._payload)
+
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, *_args, **_kwargs):
+                self.calls += 1
+                return _Response(500, {"Code": 500001, "Message": "temporary server error"})
+
+        client = KabuRestClient("http://localhost:18080")
+        client._token = "token"  # type: ignore[attr-defined]
+        client._session = _Session()  # type: ignore[attr-defined]
+
+        with self.assertRaises(KabuApiError):
+            await client._request_json("POST", "/kabusapi/sendorder", json_body={"Price": 100.0})
+
+        self.assertEqual(client._session.calls, 1)  # type: ignore[attr-defined]
+
+    async def test_request_json_retries_non_order_api(self) -> None:
+        class _Response:
+            def __init__(self, status: int, payload: dict):
+                self.status = status
+                self._payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self) -> str:
+                return json.dumps(self._payload)
+
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+                self.responses = [
+                    (500, {"Code": 500001}),
+                    (503, {"Code": 500002}),
+                    (200, {"ok": True}),
+                ]
+
+            def request(self, *_args, **_kwargs):
+                self.calls += 1
+                status, payload = self.responses[min(self.calls - 1, len(self.responses) - 1)]
+                return _Response(status, payload)
+
+        client = KabuRestClient("http://localhost:18080")
+        client._token = "token"  # type: ignore[attr-defined]
+        client._session = _Session()  # type: ignore[attr-defined]
+
+        result = await client._request_json("GET", "/kabusapi/orders", params={"product": 0})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(client._session.calls, 3)  # type: ignore[attr-defined]
+
     async def test_sendorder_uses_stored_password(self) -> None:
         captured: dict = {}
 
@@ -156,7 +284,7 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
             profile=OrderProfile(mode="margin"),
         )
         self.assertEqual(captured["json_body"]["CashMargin"], 2)
-        self.assertEqual(captured["json_body"]["MarginTradeType"], 3)
+        self.assertEqual(captured["json_body"]["MarginTradeType"], OrderProfile().margin_trade_type)
 
     async def test_unknown_mode_is_rejected(self) -> None:
         client = KabuRestClient("http://localhost:18080")

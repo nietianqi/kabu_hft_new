@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -15,6 +16,38 @@ from kabu_hft.oms.orders import OrderLedger, OrderStatus, WorkingOrderRecord
 from kabu_hft.oms.reconciliation import reconcile_order_state
 
 logger = logging.getLogger("kabu.execution")
+
+
+def _extract_error_code(payload: object) -> int | None:
+    candidates: list[object] = []
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("Code"),
+                payload.get("ResultCode"),
+                payload.get("code"),
+                payload.get("result_code"),
+            ]
+        )
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                candidates.extend(
+                    [
+                        item.get("Code"),
+                        item.get("ResultCode"),
+                        item.get("code"),
+                        item.get("result_code"),
+                    ]
+                )
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 class ExecutionState(str, Enum):
@@ -396,6 +429,7 @@ class ExecutionController:
         score: float,
         reason: str,
         force: bool,
+        target_price: float | None = None,
     ) -> bool:
         if self.inventory.qty <= 0 or self.working_order is not None:
             return False
@@ -406,6 +440,13 @@ class ExecutionController:
             score=score,
             force=force,
         )
+        if target_price is not None and not decision.is_market:
+            exit_side = -self.inventory.side
+            decision = PriceDecision(
+                price=self._align_price_to_tick(target_price, side=exit_side),
+                is_market=False,
+                edge_ticks=decision.edge_ticks,
+            )
         qty = self.inventory.qty
         self.stats["close_attempts"] += 1
         now_ns = self._clock.time_ns()
@@ -484,7 +525,29 @@ class ExecutionController:
         else:
             if self.rest_client is None:
                 raise RuntimeError("rest_client is required for live trading (dry_run=False)")
-            await self.rest_client.cancel_order(order_id)
+            try:
+                await self.rest_client.cancel_order(order_id)
+            except KabuApiError as exc:
+                error_code = _extract_error_code(exc.payload)
+                if exc.status == 500 and error_code == 43:
+                    # kabu: cancel can race with exchange fill and return code=43
+                    # ("already filled"). Treat as idempotent success and wait for
+                    # reconcile to finalize local order state.
+                    self.stats["cancel_orders"] += 1
+                    logger.info(
+                        "cancel ignored symbol=%s order_id=%s code=43 already_filled reason=%s",
+                        self.symbol,
+                        order_id,
+                        reason,
+                    )
+                    return True
+                if self.working_order is not None and self.working_order.order_id == order_id:
+                    self.working_order.cancel_requested = False
+                raise
+            except Exception:
+                if self.working_order is not None and self.working_order.order_id == order_id:
+                    self.working_order.cancel_requested = False
+                raise
         self.stats["cancel_orders"] += 1
         logger.info("cancel requested symbol=%s order_id=%s reason=%s", self.symbol, order_id, reason)
         return True
@@ -499,6 +562,9 @@ class ExecutionController:
 
     async def check_timeout(self, now_ns: int) -> bool:
         if self.working_order is None:
+            return False
+        if self.working_order.purpose == "exit":
+            # Keep close quotes on book; strategy manages exit life-cycle.
             return False
         if self.working_age_ns(now_ns) <= self.max_pending_ns:
             return False
@@ -610,6 +676,20 @@ class ExecutionController:
     def _next_paper_order_id(self) -> str:
         self.paper_order_counter += 1
         return f"PAPER-{self.symbol}-{self.paper_order_counter}"
+
+    def _align_price_to_tick(self, price: float, *, side: int) -> float:
+        """Snap price to valid tick grid.
+
+        side > 0 (buy): floor to avoid paying more than intended.
+        side < 0 (sell): ceil to avoid selling below intended target.
+        """
+        tick = max(self.selector.tick_size, 1e-9)
+        steps = price / tick
+        if side > 0:
+            snapped_steps = math.floor(steps + 1e-9)
+        else:
+            snapped_steps = math.ceil(steps - 1e-9)
+        return max(snapped_steps * tick, tick)
 
     def _paper_fill(self, *, limit_price: float, reason: str) -> None:
         if self.working_order is None:

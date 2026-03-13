@@ -59,6 +59,8 @@ class MarketStateDetector:
         self.event_burst_min_events = max(event_burst_min_events, 2)
         self._event_times: deque[int] = deque()
         self._prev_mid = 0.0
+        self._trade_drought_warn_interval_ns = 10_000_000_000  # 10 seconds
+        self._last_trade_drought_warn_ns: dict[str, int] = {}
 
     def evaluate(self, snapshot: BoardSnapshot, now_ns: int | None = None) -> MarketStateView:
         now = now_ns if now_ns is not None else time.time_ns()
@@ -82,10 +84,15 @@ class MarketStateDetector:
             else 0.0
         )
         if trade_lag_ms > 5_000:
-            logger.warning(
-                "trade drought symbol ts_lag=%.0fms: no recent trades, Tape-OFI unreliable",
-                trade_lag_ms,
-            )
+            symbol = snapshot.symbol
+            last_warn_ns = self._last_trade_drought_warn_ns.get(symbol, 0)
+            if now - last_warn_ns >= self._trade_drought_warn_interval_ns:
+                logger.warning(
+                    "trade drought symbol=%s ts_lag=%.0fms: no recent trades, Tape-OFI unreliable",
+                    symbol,
+                    trade_lag_ms,
+                )
+                self._last_trade_drought_warn_ns[symbol] = now
 
         jump_ticks = 0.0
         if self._prev_mid > 0.0:

@@ -84,6 +84,14 @@ _MARGIN_MODES: frozenset[str] = frozenset(
 )
 
 _TSE_PLUS_RETRY_CODES: frozenset[int] = frozenset({100368, 100378})
+_ORDER_MUTATION_PATHS: frozenset[str] = frozenset(
+    {
+        "/kabusapi/sendorder",
+        "/kabusapi/sendorder/future",
+        "/kabusapi/sendorder/option",
+        "/kabusapi/cancelorder",
+    }
+)
 
 
 def _is_margin_mode(mode: str) -> bool:
@@ -144,6 +152,19 @@ def _extract_error_message(payload: Any) -> str | None:
                 if value not in (None, ""):
                     return str(value)
     return None
+
+
+def _is_fill_detail(detail: dict[str, Any]) -> bool:
+    """Return True only for detail rows that represent execution fills.
+
+    kabu orders Details can include multiple record types (new/order accepted/cancel/expire/etc).
+    RecType=1 is often a new-order record and its Qty is the order quantity, not executed quantity.
+    """
+    rec_type = _parse_int(detail.get("RecType"))
+    if rec_type in {3, 8}:
+        return True
+    execution_id = str(detail.get("ExecutionID") or "").strip()
+    return execution_id.startswith("E")
 
 
 @dataclass(slots=True)
@@ -408,26 +429,30 @@ class KabuAdapter:
         is_final = state_code == 5 or order_state_code == 5
         details = raw.get("Details") or []
 
-        weighted_value = 0.0
-        weighted_qty = 0
+        fill_weighted_value = 0.0
+        fill_weighted_qty = 0
         latest_fill_ts_ns = 0
         for detail in details:
             if not isinstance(detail, dict):
                 continue
-            detail_qty = _parse_int(detail.get("Qty"))
-            detail_price = _parse_float(detail.get("Price"))
-            if detail_qty > 0 and detail_price > 0:
-                weighted_value += detail_qty * detail_price
-                weighted_qty += detail_qty
-            detail_ts = _to_ns(detail.get("Time") or detail.get("RecvTime"))
-            if detail_ts > latest_fill_ts_ns:
-                latest_fill_ts_ns = detail_ts
+            detail_ts = _to_ns(
+                detail.get("ExecutionDay")
+                or detail.get("TransactTime")
+                or detail.get("RecvTime")
+                or detail.get("Time")
+            )
+            if _is_fill_detail(detail):
+                detail_qty = _parse_int(detail.get("Qty"))
+                detail_price = _parse_float(detail.get("Price"))
+                if detail_qty > 0 and detail_price > 0:
+                    fill_weighted_value += detail_qty * detail_price
+                    fill_weighted_qty += detail_qty
+                    if detail_ts > latest_fill_ts_ns:
+                        latest_fill_ts_ns = detail_ts
 
         avg_fill_price = 0.0
-        if weighted_qty > 0:
-            avg_fill_price = weighted_value / weighted_qty
-            if cum_qty == 0:
-                cum_qty = weighted_qty
+        if cum_qty > 0 and fill_weighted_qty > 0:
+            avg_fill_price = fill_weighted_value / fill_weighted_qty
         elif cum_qty > 0 and price > 0:
             avg_fill_price = price
 
@@ -760,7 +785,11 @@ class KabuRestClient:
                 if response.status < 400:
                     return payload
 
-                should_retry = response.status in {429, 500, 502, 503, 504}
+                # Avoid automatic retries for order-mutation APIs to reduce duplicate-order risk.
+                should_retry = (
+                    response.status in {429, 500, 502, 503, 504}
+                    and path not in _ORDER_MUTATION_PATHS
+                )
                 if should_retry and attempt < 2:
                     await asyncio.sleep(0.1 * (2**attempt))
                     continue

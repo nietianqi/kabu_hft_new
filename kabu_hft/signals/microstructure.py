@@ -12,10 +12,12 @@ from kabu_hft.gateway import BoardSnapshot, TradePrint
 
 
 class OnlineZScore:
-    __slots__ = ("window", "buf", "sum_x", "sum_x2")
+    __slots__ = ("window", "min_samples", "buf", "sum_x", "sum_x2")
 
     def __init__(self, window: int):
-        self.window = window
+        self.window = max(int(window), 1)
+        # Warm-up uses at most 50 samples, but should adapt when callers choose smaller windows.
+        self.min_samples = min(50, self.window)
         self.buf: deque[float] = deque()
         self.sum_x = 0.0
         self.sum_x2 = 0.0
@@ -31,7 +33,7 @@ class OnlineZScore:
             self.sum_x2 -= removed * removed
 
         count = len(self.buf)
-        if count < min(50, self.window):
+        if count < self.min_samples:
             return 0.0
 
         mean = self.sum_x / count

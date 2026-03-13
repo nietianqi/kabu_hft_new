@@ -26,7 +26,7 @@ DEFAULT_CONFIG: dict = {
         "cash_buy_deliv_type": 2,
         "cash_sell_fund_type": "",
         "cash_sell_deliv_type": 0,
-        "margin_trade_type": 3,
+        "margin_trade_type": 1,
         "margin_open_fund_type": "11",
         "margin_open_deliv_type": 0,
         "margin_close_deliv_type": 2,
@@ -49,6 +49,10 @@ DEFAULT_CONFIG: dict = {
         "zscore_window": 300,
         "mp_ema_alpha": 0.10,
         "max_hold_seconds": 45,
+        "take_profit_ticks": 1.0,
+        "take_profit_min_hold_ms": 300,
+        "stop_loss_ticks": 1.5,
+        "disable_stop_loss": False,
         "max_pending_ms": 2500,
         "min_order_lifetime_ms": 250,
         "min_edge_ticks": 0.25,
@@ -80,7 +84,7 @@ DEFAULT_CONFIG: dict = {
     "symbols": [
         {
             "symbol": "9984",
-            "exchange": 1,
+            "exchange": 27,
             "tick_size": 50.0,
             "base_qty": 100,
             "fixed_qty": None,
@@ -91,7 +95,7 @@ DEFAULT_CONFIG: dict = {
         },
         {
             "symbol": "4568",
-            "exchange": 1,
+            "exchange": 27,
             "tick_size": 5.0,
             "base_qty": 100,
             "fixed_qty": None,
@@ -143,7 +147,7 @@ class OrderProfile:
     cash_buy_deliv_type: int = 2
     cash_sell_fund_type: str = ""
     cash_sell_deliv_type: int = 0
-    margin_trade_type: int = 3
+    margin_trade_type: int = 1
     margin_open_fund_type: str = "11"
     margin_open_deliv_type: int = 0
     margin_close_deliv_type: int = 2
@@ -161,7 +165,7 @@ class OrderProfile:
             cash_buy_deliv_type=int(payload.get("cash_buy_deliv_type", 2)),
             cash_sell_fund_type=str(payload.get("cash_sell_fund_type", "")),
             cash_sell_deliv_type=int(payload.get("cash_sell_deliv_type", 0)),
-            margin_trade_type=int(payload.get("margin_trade_type", 3)),
+            margin_trade_type=int(payload.get("margin_trade_type", 1)),
             margin_open_fund_type=str(payload.get("margin_open_fund_type", "11")),
             margin_open_deliv_type=int(payload.get("margin_open_deliv_type", 0)),
             margin_close_deliv_type=int(payload.get("margin_close_deliv_type", 2)),
@@ -196,6 +200,10 @@ class StrategyConfig:
     zscore_window: int
     mp_ema_alpha: float
     max_hold_seconds: int
+    take_profit_ticks: float
+    take_profit_min_hold_ms: int
+    stop_loss_ticks: float
+    disable_stop_loss: bool
     max_pending_ms: int
     min_order_lifetime_ms: int
     min_edge_ticks: float
@@ -254,7 +262,7 @@ def load_config(path: str | Path | None) -> AppConfig:
         strategies.append(
             StrategyConfig(
                 symbol=str(raw_symbol["symbol"]),
-                exchange=int(raw_symbol.get("exchange", 1)),
+                exchange=int(raw_symbol.get("exchange", 27)),
                 tick_size=float(raw_symbol["tick_size"]),
                 base_qty=int(raw_symbol.get("base_qty", 100)),
                 fixed_qty=fixed_qty if fixed_qty and fixed_qty > 0 else None,
@@ -277,6 +285,10 @@ def load_config(path: str | Path | None) -> AppConfig:
                 zscore_window=int(merged.get("zscore_window", 300)),
                 mp_ema_alpha=float(merged.get("mp_ema_alpha", 0.10)),
                 max_hold_seconds=int(merged.get("max_hold_seconds", 45)),
+                take_profit_ticks=float(merged.get("take_profit_ticks", 1.0)),
+                take_profit_min_hold_ms=int(merged.get("take_profit_min_hold_ms", 300)),
+                stop_loss_ticks=float(merged.get("stop_loss_ticks", 1.5)),
+                disable_stop_loss=bool(merged.get("disable_stop_loss", False)),
                 max_pending_ms=int(merged.get("max_pending_ms", 2500)),
                 min_order_lifetime_ms=int(merged.get("min_order_lifetime_ms", 250)),
                 min_edge_ticks=float(merged.get("min_edge_ticks", 0.25)),

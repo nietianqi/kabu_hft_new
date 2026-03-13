@@ -1,5 +1,6 @@
 import time
 import unittest
+from unittest.mock import patch
 
 from kabu_hft.core.market_state import MarketState, MarketStateDetector
 from kabu_hft.gateway import BoardSnapshot, Level
@@ -111,6 +112,41 @@ class MarketRegimeTests(unittest.TestCase):
         )
         self.assertEqual(burst.state, MarketState.ABNORMAL)
         self.assertEqual(burst.reason, "event_burst")
+
+    def test_trade_drought_warning_is_throttled(self) -> None:
+        detector = MarketStateDetector(
+            tick_size=1.0,
+            stale_quote_ms=5_000,
+            queue_spread_max_ticks=1.0,
+            abnormal_max_spread_ticks=6.0,
+            max_event_rate_hz=200.0,
+            state_window_ms=3_000,
+            jump_threshold_ticks=5.0,
+        )
+        base = time.time_ns()
+
+        def _drought_snapshot(ts_ns: int, quote_ts_ns: int, trade_ts_ns: int) -> BoardSnapshot:
+            snapshot = _snapshot(bid=100.0, ask=101.0, ts_ns=ts_ns)
+            snapshot.bid_ts_ns = quote_ts_ns
+            snapshot.ask_ts_ns = quote_ts_ns
+            snapshot.current_ts_ns = trade_ts_ns
+            return snapshot
+
+        with patch("kabu_hft.core.market_state.logger.warning") as mock_warn:
+            detector.evaluate(
+                _drought_snapshot(base, base, base - 10_000_000_000),
+                now_ns=base,
+            )
+            detector.evaluate(
+                _drought_snapshot(base + 1_000_000_000, base + 1_000_000_000, base - 9_000_000_000),
+                now_ns=base + 1_000_000_000,
+            )
+            detector.evaluate(
+                _drought_snapshot(base + 11_000_000_000, base + 11_000_000_000, base + 1_000_000_000),
+                now_ns=base + 11_000_000_000,
+            )
+
+        self.assertEqual(mock_warn.call_count, 2)
 
 
 if __name__ == "__main__":
