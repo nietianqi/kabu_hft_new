@@ -156,15 +156,23 @@ class KabuHFTApp:
         symbols: list[dict[str, int | str]] = []
         seen: set[tuple[str, int]] = set()
         for strategy in self.strategies.values():
-            key = (strategy.config.symbol, strategy.config.exchange)
+            register_exchange = self._register_exchange_code(strategy.config.exchange)
+            key = (strategy.config.symbol, register_exchange)
             if key in seen:
                 logger.warning(
                     "duplicate symbol config skipped symbol=%s exchange=%s",
                     strategy.config.symbol,
-                    strategy.config.exchange,
+                    register_exchange,
                 )
                 continue
             seen.add(key)
+            if register_exchange != strategy.config.exchange:
+                logger.info(
+                    "register exchange normalized symbol=%s order_exchange=%s register_exchange=%s",
+                    strategy.config.symbol,
+                    strategy.config.exchange,
+                    register_exchange,
+                )
             symbols.append({"Symbol": key[0], "Exchange": key[1]})
 
         if len(symbols) > 50:
@@ -172,6 +180,14 @@ class KabuHFTApp:
                 f"kabu PUSH supports at most 50 registered symbols; got {len(symbols)}"
             )
         return symbols
+
+    @staticmethod
+    def _register_exchange_code(order_exchange: int) -> int:
+        # kabu register API does not accept TSE+ (27) / SOR (9) for symbol registration.
+        # We subscribe with TSE (1) and still place orders with strategy-configured exchange.
+        if order_exchange in {9, 27}:
+            return 1
+        return order_exchange
 
     def _find_strategy(self, symbol: str, exchange: int) -> HFTStrategy | None:
         strategy = self.strategies.get((symbol, exchange))
