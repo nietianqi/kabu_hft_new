@@ -79,7 +79,10 @@ DEFAULT_CONFIG: dict = {
             "tape_ofi": 0.20,
             "micro_momentum": 0.15,
             "microprice_tilt": 0.10,
+            "whale": 0.0,
         },
+        "whale_qty_threshold": 1000,
+        "whale_window_sec": 15,
     },
     "symbols": [
         {
@@ -125,6 +128,7 @@ class SignalWeights:
     tape_ofi: float = 0.20
     micro_momentum: float = 0.15
     microprice_tilt: float = 0.10
+    whale: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: dict | None) -> "SignalWeights":
@@ -135,6 +139,7 @@ class SignalWeights:
             tape_ofi=float(payload.get("tape_ofi", 0.20)),
             micro_momentum=float(payload.get("micro_momentum", 0.15)),
             microprice_tilt=float(payload.get("microprice_tilt", 0.10)),
+            whale=float(payload.get("whale", 0.0)),
         )
 
 
@@ -224,6 +229,8 @@ class StrategyConfig:
     allow_aggressive_entry: bool
     allow_aggressive_exit: bool
     commission_per_share: float
+    whale_qty_threshold: int
+    whale_window_sec: int
     signal_weights: SignalWeights = field(default_factory=SignalWeights)
 
 
@@ -309,6 +316,8 @@ def load_config(path: str | Path | None) -> AppConfig:
                 allow_aggressive_entry=bool(merged.get("allow_aggressive_entry", False)),
                 allow_aggressive_exit=bool(merged.get("allow_aggressive_exit", True)),
                 commission_per_share=float(merged.get("commission_per_share", 0.0)),
+                whale_qty_threshold=int(merged.get("whale_qty_threshold", 1000)),
+                whale_window_sec=int(merged.get("whale_window_sec", 15)),
                 signal_weights=SignalWeights.from_dict(merged.get("signal_weights")),
             )
         )

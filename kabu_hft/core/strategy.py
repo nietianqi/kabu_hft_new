@@ -41,6 +41,8 @@ class HFTStrategy:
             tick_size=config.tick_size,
             zscore_window=config.zscore_window,
             weights=config.signal_weights,
+            whale_qty_threshold=config.whale_qty_threshold,
+            whale_window_sec=config.whale_window_sec,
         )
         self.risk = RiskGuard(
             base_qty=config.base_qty,

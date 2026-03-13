@@ -61,6 +61,8 @@ class SignalPacket:
     micro_momentum_z: float
     microprice_tilt_z: float
     composite: float
+    whale_raw: float = 0.0
+    whale_z: float = 0.0
 
 
 class OBISignal:
@@ -175,17 +177,49 @@ class MicropriceSignals:
             snapshot.ask_size * snapshot.bid + snapshot.bid_size * snapshot.ask
         ) / total_size
 
-        if self.ema is None:
-            self.ema = microprice
-        else:
-            self.ema = self.ema_alpha * microprice + (1.0 - self.ema_alpha) * self.ema
-
         tick_size = self.tick_size if self.tick_size > 0 else 1.0
-        micro_momentum = (microprice - self.ema) / tick_size
+        old_ema = self.ema
+        if old_ema is None:
+            self.ema = microprice
+            micro_momentum = 0.0
+        else:
+            micro_momentum = (microprice - old_ema) / tick_size
+            self.ema = self.ema_alpha * microprice + (1.0 - self.ema_alpha) * old_ema
 
         half_spread = snapshot.spread / 2.0
         microprice_tilt = 0.0 if half_spread <= 0 else (microprice - snapshot.mid) / half_spread
         return microprice, micro_momentum, microprice_tilt
+
+
+class WhalePressureSignal:
+    def __init__(self, qty_threshold: int, window_sec: int):
+        self.qty_threshold = qty_threshold
+        self.window_ns = window_sec * 1_000_000_000
+        self.events: deque[tuple[int, int, int]] = deque()
+        self.buy_qty = 0
+        self.sell_qty = 0
+
+    def on_trade(self, trade: TradePrint) -> float:
+        if trade.size < self.qty_threshold:
+            return self.current
+        buy_v = trade.size if trade.side > 0 else 0
+        sell_v = trade.size if trade.side < 0 else 0
+        self.events.append((trade.ts_ns, buy_v, sell_v))
+        self.buy_qty += buy_v
+        self.sell_qty += sell_v
+        self._trim(trade.ts_ns)
+        return self.current
+
+    def _trim(self, now_ns: int) -> None:
+        while self.events and now_ns - self.events[0][0] > self.window_ns:
+            _, b, s = self.events.popleft()
+            self.buy_qty -= b
+            self.sell_qty -= s
+
+    @property
+    def current(self) -> float:
+        total = self.buy_qty + self.sell_qty
+        return 0.0 if total <= 0 else (self.buy_qty - self.sell_qty) / total
 
 
 class SignalStack:
@@ -201,11 +235,14 @@ class SignalStack:
         tick_size: float,
         zscore_window: int,
         weights: SignalWeights,
+        whale_qty_threshold: int = 1000,
+        whale_window_sec: int = 15,
     ):
         self.obi = OBISignal(obi_depth, obi_decay)
         self.lob_ofi = LOBOFISignal(lob_ofi_depth, lob_ofi_decay)
         self.tape = TapeOFISignal(tape_window_sec)
         self.micro = MicropriceSignals(mp_ema_alpha, tick_size)
+        self.whale = WhalePressureSignal(whale_qty_threshold, whale_window_sec)
         self.weights = weights
         self.zscores = {
             "obi": OnlineZScore(zscore_window),
@@ -213,6 +250,7 @@ class SignalStack:
             "tape_ofi": OnlineZScore(zscore_window),
             "micro_momentum": OnlineZScore(zscore_window),
             "microprice_tilt": OnlineZScore(zscore_window),
+            "whale": OnlineZScore(zscore_window),
         }
         self.last: SignalPacket | None = None
 
@@ -222,11 +260,13 @@ class SignalStack:
         tape_ofi_raw = self.tape.current
         microprice, micro_momentum_raw, microprice_tilt_raw = self.micro.compute(snapshot)
 
+        whale_raw = self.whale.current
         obi_z = self.zscores["obi"].update(obi_raw)
         lob_ofi_z = self.zscores["lob_ofi"].update(lob_ofi_raw)
         tape_ofi_z = self.zscores["tape_ofi"].update(tape_ofi_raw)
         micro_momentum_z = self.zscores["micro_momentum"].update(micro_momentum_raw)
         microprice_tilt_z = self.zscores["microprice_tilt"].update(microprice_tilt_raw)
+        whale_z = self.zscores["whale"].update(whale_raw)
 
         composite = (
             self.weights.lob_ofi * lob_ofi_z
@@ -234,6 +274,7 @@ class SignalStack:
             + self.weights.tape_ofi * tape_ofi_z
             + self.weights.micro_momentum * micro_momentum_z
             + self.weights.microprice_tilt * microprice_tilt_z
+            + self.weights.whale * whale_z
         )
 
         self.last = SignalPacket(
@@ -251,8 +292,11 @@ class SignalStack:
             micro_momentum_z=micro_momentum_z,
             microprice_tilt_z=microprice_tilt_z,
             composite=composite,
+            whale_raw=whale_raw,
+            whale_z=whale_z,
         )
         return self.last
 
     def on_trade(self, trade: TradePrint) -> float:
+        self.whale.on_trade(trade)
         return self.tape.on_trade(trade)

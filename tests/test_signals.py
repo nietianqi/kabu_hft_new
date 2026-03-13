@@ -2,7 +2,7 @@ import unittest
 
 from kabu_hft.config import SignalWeights
 from kabu_hft.gateway import BoardSnapshot, Level, TradePrint
-from kabu_hft.signals.microstructure import OnlineZScore
+from kabu_hft.signals.microstructure import OnlineZScore, WhalePressureSignal
 from kabu_hft.signals import SignalStack
 
 
@@ -63,6 +63,57 @@ class SignalStackTests(unittest.TestCase):
         assert last_signal is not None
         self.assertGreater(last_signal.obi_raw, 0)
         self.assertGreater(last_signal.composite, 0)
+
+
+def _trade(ts_ns: int, size: int, side: int) -> TradePrint:
+    return TradePrint(
+        symbol="9984",
+        exchange=1,
+        ts_ns=ts_ns,
+        price=100.0,
+        size=size,
+        side=side,
+        cumulative_volume=size,
+    )
+
+
+class WhalePressureSignalTests(unittest.TestCase):
+    def test_small_trades_ignored(self) -> None:
+        whale = WhalePressureSignal(qty_threshold=500, window_sec=60)
+        whale.on_trade(_trade(ts_ns=1_000_000_000, size=499, side=1))
+        self.assertEqual(whale.current, 0.0)
+
+    def test_large_buy_produces_positive_signal(self) -> None:
+        whale = WhalePressureSignal(qty_threshold=500, window_sec=60)
+        whale.on_trade(_trade(ts_ns=1_000_000_000, size=1000, side=1))
+        self.assertEqual(whale.current, 1.0)
+
+    def test_large_sell_produces_negative_signal(self) -> None:
+        whale = WhalePressureSignal(qty_threshold=500, window_sec=60)
+        whale.on_trade(_trade(ts_ns=1_000_000_000, size=1000, side=-1))
+        self.assertEqual(whale.current, -1.0)
+
+    def test_mixed_large_trades_balance(self) -> None:
+        whale = WhalePressureSignal(qty_threshold=500, window_sec=60)
+        whale.on_trade(_trade(ts_ns=1_000_000_000, size=1000, side=1))
+        whale.on_trade(_trade(ts_ns=2_000_000_000, size=1000, side=-1))
+        self.assertEqual(whale.current, 0.0)
+
+    def test_window_expiry_resets_signal(self) -> None:
+        whale = WhalePressureSignal(qty_threshold=500, window_sec=10)
+        whale.on_trade(_trade(ts_ns=1_000_000_000, size=1000, side=1))
+        self.assertEqual(whale.current, 1.0)
+        # Advance time past window (10s = 10_000_000_000 ns)
+        whale.on_trade(_trade(ts_ns=12_000_000_000, size=1000, side=-1))
+        # Old buy expired; only the new sell remains → -1.0
+        self.assertEqual(whale.current, -1.0)
+
+    def test_small_trades_do_not_affect_window_trim(self) -> None:
+        whale = WhalePressureSignal(qty_threshold=500, window_sec=10)
+        whale.on_trade(_trade(ts_ns=1_000_000_000, size=1000, side=1))
+        # Small trade far in future — should not trim the large buy
+        whale.on_trade(_trade(ts_ns=5_000_000_000, size=100, side=-1))
+        self.assertEqual(whale.current, 1.0)
 
 
 if __name__ == "__main__":
