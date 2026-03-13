@@ -563,6 +563,9 @@ class ExecutionController:
     async def check_timeout(self, now_ns: int) -> bool:
         if self.working_order is None:
             return False
+        if self.working_order.purpose == "exit":
+            # Keep close quotes on book; strategy manages exit life-cycle.
+            return False
         if self.working_age_ns(now_ns) <= self.max_pending_ns:
             return False
         return await self.cancel_working(reason="pending_timeout")

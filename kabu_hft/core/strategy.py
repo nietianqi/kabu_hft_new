@@ -262,14 +262,7 @@ class HFTStrategy:
             return
 
         if state is ExecutionState.CLOSING:
-            must_close, reason = self.risk.must_close(
-                open_ts_ns=self.execution.inventory.opened_ts_ns,
-                snapshot=snapshot,
-                now_ns=now_ns,
-                now_dt=now_dt,
-            )
-            if must_close and self.execution.working_age_ns(now_ns) > self.execution.min_order_lifetime_ns:
-                await self.execution.cancel_working(reason=reason)
+            # Keep exit quote resting. Do not loop-cancel close orders.
             return
 
         if state is ExecutionState.OPEN:
