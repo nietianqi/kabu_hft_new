@@ -170,7 +170,7 @@ class BoardSnapshot:
     prev_board: Optional["BoardSnapshot"] = field(default=None, repr=False)
     duplicate: bool = False
     out_of_order: bool = False
-    # 気配フラグ (quote sign) from kabu Station API.
+    # 气配标志（quote sign），来自 kabu Station API。
     # Note: field names are reversed in the API — AskSign carries the bid-side sign,
     # BidSign carries the ask-side sign.  We store them corrected here.
     bid_sign: str = ""   # from kabu AskSign (bid side, naming is reversed in API)
@@ -289,7 +289,7 @@ class KabuAdapter:
         _ask_sz_raw = _parse_int(raw.get("BidQty"))
         ask_size = _ask_sz_raw if _ask_sz_raw > 0 else (asks[0].size if asks else 0)
 
-        # 気配フラグ — kabu API names are reversed: AskSign carries bid-side, BidSign carries ask-side.
+        # 气配标志 — kabu API 字段名与实际含义相反：AskSign 存储买方气配，BidSign 存储卖方气配。
         bid_sign = str(raw.get("AskSign") or "")
         ask_sign = str(raw.get("BidSign") or "")
 
@@ -567,7 +567,7 @@ class KabuRestClient:
             retry_body["Exchange"] = 27
             code = _extract_error_code(exc.payload)
             logger.warning(
-                "sendorder rejected on exchange=1 symbol=%s code=%s; retrying exchange=27 (東証+)",
+                "sendorder rejected on exchange=1 symbol=%s code=%s; retrying exchange=27 (东证+)",
                 symbol,
                 code,
             )
