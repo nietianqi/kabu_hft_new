@@ -48,7 +48,7 @@
     "cooling_seconds": 300,
     "consecutive_loss_limit": 3,
     "max_spread_ticks": 3.0,
-    "stale_quote_ms": 1200,
+    "stale_quote_ms": 2000,
     "poll_interval_ms": 350,
     "min_board_interval_ms": 8.0,
     "queue_spread_max_ticks": 1.0,
@@ -61,6 +61,7 @@
     "max_requotes_per_minute": 30,
     "allow_aggressive_entry": false,
     "allow_aggressive_exit": true,
+    "commission_per_share": 0.0,
     "signal_weights": {
       "lob_ofi": 0.30,
       "obi": 0.25,

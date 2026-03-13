@@ -55,7 +55,7 @@ DEFAULT_CONFIG: dict = {
         "cooling_seconds": 300,
         "consecutive_loss_limit": 3,
         "max_spread_ticks": 3.0,
-        "stale_quote_ms": 1200,
+        "stale_quote_ms": 2000,
         "poll_interval_ms": 350,
         "min_board_interval_ms": 8.0,
         "queue_spread_max_ticks": 1.0,
@@ -68,6 +68,7 @@ DEFAULT_CONFIG: dict = {
         "max_requotes_per_minute": 30,
         "allow_aggressive_entry": False,
         "allow_aggressive_exit": True,
+        "commission_per_share": 0.0,
         "signal_weights": {
             "lob_ofi": 0.30,
             "obi": 0.25,
@@ -214,6 +215,7 @@ class StrategyConfig:
     max_requotes_per_minute: int
     allow_aggressive_entry: bool
     allow_aggressive_exit: bool
+    commission_per_share: float
     signal_weights: SignalWeights = field(default_factory=SignalWeights)
 
 
@@ -294,6 +296,7 @@ def load_config(path: str | Path | None) -> AppConfig:
                 max_requotes_per_minute=int(merged.get("max_requotes_per_minute", 30)),
                 allow_aggressive_entry=bool(merged.get("allow_aggressive_entry", False)),
                 allow_aggressive_exit=bool(merged.get("allow_aggressive_exit", True)),
+                commission_per_share=float(merged.get("commission_per_share", 0.0)),
                 signal_weights=SignalWeights.from_dict(merged.get("signal_weights")),
             )
         )

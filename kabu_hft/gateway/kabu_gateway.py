@@ -730,8 +730,12 @@ class KabuWebSocket:
 
     async def _connect(self, websockets_module: Any) -> Any:
         kwargs: dict[str, Any] = {
-            "ping_interval": 25,
-            "ping_timeout": 30,
+            # kabu Station does not respond to WebSocket-level ping frames,
+            # causing the websockets library to time out every ~65 s and close
+            # with code 1011.  Disable automatic pings here; the gateway's own
+            # reconnect loop handles connection recovery if the socket goes dead.
+            "ping_interval": None,
+            "ping_timeout": None,
             "max_size": 2**20,
         }
         if self._api_token:

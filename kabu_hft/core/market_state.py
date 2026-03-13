@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from kabu_hft.gateway import BoardSnapshot
+
+logger = logging.getLogger("kabu.market_state")
 
 
 class MarketState(str, Enum):
@@ -28,6 +31,9 @@ class MarketStateView:
     event_rate_hz: float
     stale_ms: float
     jump_ticks: float
+    trade_lag_ms: float = field(default=0.0)
+    """Milliseconds since last trade (CurrentPriceTime) vs last quote (BidTime).
+    A large value (>5000ms) means no recent trades; Tape-OFI is unreliable."""
 
 
 class MarketStateDetector:
@@ -67,6 +73,20 @@ class MarketStateDetector:
         stale_ms = max(0.0, (now - snapshot.ts_ns) / 1_000_000)
         stale = stale_ms > self.stale_quote_ms
 
+        # How long since the last executed trade vs the most recent bid/ask update.
+        # Large trade_lag means no recent transactions: Tape-OFI signal is unreliable.
+        quote_ts = max(snapshot.bid_ts_ns, snapshot.ask_ts_ns)
+        trade_lag_ms = (
+            max(0.0, (quote_ts - snapshot.current_ts_ns) / 1_000_000)
+            if quote_ts > 0 and snapshot.current_ts_ns > 0
+            else 0.0
+        )
+        if trade_lag_ms > 5_000:
+            logger.warning(
+                "trade drought symbol ts_lag=%.0fms: no recent trades, Tape-OFI unreliable",
+                trade_lag_ms,
+            )
+
         jump_ticks = 0.0
         if self._prev_mid > 0.0:
             jump_ticks = abs(snapshot.mid - self._prev_mid) / self.tick_size
@@ -82,6 +102,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         if stale:
             return MarketStateView(
@@ -91,6 +112,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         if snapshot.bid_sign in _SPECIAL_QUOTE_SIGNS or snapshot.ask_sign in _SPECIAL_QUOTE_SIGNS:
             return MarketStateView(
@@ -100,6 +122,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         if spread_ticks >= self.abnormal_max_spread_ticks:
             return MarketStateView(
@@ -109,6 +132,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         if (
             len(self._event_times) >= self.event_burst_min_events
@@ -121,6 +145,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         if jump_ticks >= self.jump_threshold_ticks:
             return MarketStateView(
@@ -130,6 +155,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         if spread_ticks <= self.queue_spread_max_ticks + 1e-9:
             return MarketStateView(
@@ -139,6 +165,7 @@ class MarketStateDetector:
                 event_rate_hz=event_rate_hz,
                 stale_ms=stale_ms,
                 jump_ticks=jump_ticks,
+                trade_lag_ms=trade_lag_ms,
             )
         return MarketStateView(
             state=MarketState.NORMAL,
@@ -147,6 +174,7 @@ class MarketStateDetector:
             event_rate_hz=event_rate_hz,
             stale_ms=stale_ms,
             jump_ticks=jump_ticks,
+            trade_lag_ms=trade_lag_ms,
         )
 
     def _event_rate_hz(self, now_ns: int) -> float:

@@ -452,7 +452,7 @@ class HFTStrategy:
                 exit_price=trade.exit_price,
                 entry_ts_ns=trade.entry_ts_ns,
                 exit_ts_ns=trade.exit_ts_ns,
-                commission=0.0,
+                commission=self.config.commission_per_share * trade.qty * 2,
             )
             if self.journal is not None:
                 self.journal.log_trade(trade, self._signal_at_entry)
