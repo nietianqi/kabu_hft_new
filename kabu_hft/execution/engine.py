@@ -10,7 +10,7 @@ from typing import Optional
 
 from kabu_hft.clock import Clock, LiveClock
 from kabu_hft.config import OrderProfile
-from kabu_hft.gateway import BoardSnapshot, KabuRestClient, OrderSnapshot, TradePrint
+from kabu_hft.gateway import BoardSnapshot, KabuApiError, KabuRestClient, OrderSnapshot, TradePrint
 from kabu_hft.oms.orders import OrderLedger, OrderStatus, WorkingOrderRecord
 from kabu_hft.oms.reconciliation import reconcile_order_state
 
@@ -414,15 +414,23 @@ class ExecutionController:
         else:
             if self.rest_client is None:
                 raise RuntimeError("rest_client is required for live trading (dry_run=False)")
-            response = await self.rest_client.send_exit_order(
-                symbol=self.symbol,
-                exchange=self.exchange,
-                position_side=self.inventory.side,
-                qty=qty,
-                price=decision.price,
-                is_market=decision.is_market,
-                profile=self.order_profile,
-            )
+            try:
+                response = await self.rest_client.send_exit_order(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    position_side=self.inventory.side,
+                    qty=qty,
+                    price=decision.price,
+                    is_market=decision.is_market,
+                    profile=self.order_profile,
+                )
+            except KabuApiError as exc:
+                if "not enough inventory" in str(exc):
+                    # ローカルの inventory が broker 側と乖離している。
+                    # API から実際のポジションを取得して同期し、無限ループを防ぐ。
+                    await self._sync_inventory_from_api()
+                    return False
+                raise
             order_id = str(response.get("OrderId") or response.get("ID") or "")
             if not order_id:
                 logger.warning("exit rejected for %s: %s", self.symbol, response)
@@ -677,6 +685,40 @@ class ExecutionController:
             self.inventory.qty,
         )
         self.working_order = None
+
+    async def _sync_inventory_from_api(self) -> None:
+        """broker の実際のポジションから inventory.qty を再同期する。
+        close() で KabuApiError('not enough inventory') が発生した場合に呼び出し、
+        ローカル状態と broker 側のズレを解消して無限ループを防ぐ。
+        """
+        if self.rest_client is None:
+            logger.error("_sync_inventory_from_api: rest_client is None, cannot sync")
+            return
+        try:
+            positions = await self.rest_client.get_positions(self.symbol)
+        except Exception as exc:
+            logger.error("_sync_inventory_from_api: get_positions failed: %s", exc)
+            return
+
+        # kabu API: Side='2' → 買建て (long, internal side=+1)
+        #           Side='1' → 売建て (short, internal side=-1)
+        api_side_str = "2" if self.inventory.side == 1 else "1"
+        available = sum(
+            int(p.get("HoldQty") or 0)
+            for p in positions
+            if str(p.get("Symbol")) == str(self.symbol)
+            and str(p.get("Side")) == api_side_str
+        )
+        old_qty = self.inventory.qty
+        self.inventory.qty = available
+        logger.warning(
+            "inventory synced from API symbol=%s qty %d → %d (broker HoldQty)",
+            self.symbol,
+            old_qty,
+            available,
+        )
+        if available == 0:
+            self._reset_inventory()
 
     def _reset_inventory(self) -> None:
         self.inventory = Inventory()
