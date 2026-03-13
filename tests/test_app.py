@@ -74,6 +74,18 @@ class AppRegistrationTests(unittest.TestCase):
         }
         self.assertIsNone(app._find_strategy("9984", 27))
 
+    def test_summarize_positions_groups_by_symbol_exchange_side(self) -> None:
+        positions = [
+            {"Symbol": "4568", "Exchange": 27, "Side": "2", "LeavesQty": 100},
+            {"Symbol": "4568", "Exchange": 27, "Side": "2", "LeavesQty": 200},
+            {"Symbol": "9984", "Exchange": 1, "Side": "1", "LeavesQty": 300},
+        ]
+        summary = KabuHFTApp._summarize_positions(positions)
+        self.assertEqual(
+            summary,
+            "4568@27 side=2 count=2 qty=300; 9984@1 side=1 count=1 qty=300",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

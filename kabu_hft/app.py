@@ -229,12 +229,14 @@ class KabuHFTApp:
                 open_positions.append(position)
 
         if open_positions:
+            summary = self._summarize_positions(open_positions)
             logger.warning(
-                "EXISTING OPEN POSITIONS DETECTED (%d). fail_on_startup_positions=%s positions=%s",
+                "EXISTING OPEN POSITIONS DETECTED (%d). fail_on_startup_positions=%s summary=%s",
                 len(open_positions),
                 self.config.fail_on_startup_positions,
-                open_positions,
+                summary,
             )
+            logger.debug("existing positions detail=%s", open_positions)
         return open_positions
 
     async def _emergency_close_all(self) -> None:
@@ -279,6 +281,25 @@ class KabuHFTApp:
             except (TypeError, ValueError):
                 continue
         return 0
+
+    @classmethod
+    def _summarize_positions(cls, positions: list[dict]) -> str:
+        grouped: dict[tuple[str, int, str], dict[str, int]] = {}
+        for position in positions:
+            symbol = str(position.get("Symbol") or "?")
+            exchange = int(position.get("Exchange") or 0)
+            side = str(position.get("Side") or "?")
+            key = (symbol, exchange, side)
+            bucket = grouped.setdefault(key, {"count": 0, "qty": 0})
+            bucket["count"] += 1
+            bucket["qty"] += cls._position_qty(position)
+
+        parts: list[str] = []
+        for (symbol, exchange, side), values in sorted(grouped.items()):
+            parts.append(
+                f"{symbol}@{exchange} side={side} count={values['count']} qty={values['qty']}"
+            )
+        return "; ".join(parts)
 
 
 async def run_async(config_path: str) -> None:
