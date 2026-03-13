@@ -232,6 +232,10 @@ class HFTStrategy:
         if state is ExecutionState.OPENING:
             working = self.execution.working_order
             if working is None:
+                logger.warning(
+                    "state=OPENING but working_order is None symbol=%s — possible state desync",
+                    self.config.symbol,
+                )
                 return
             queue_threshold = self._queue_threshold(snapshot, abs(score))
             mode = self._parse_mode(working.mode)

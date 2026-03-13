@@ -117,6 +117,36 @@ class OmsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ledger.apply_fill("9984", side=0, qty=100, price=100.0)
 
+    def test_reconcile_does_not_downgrade_terminal_status(self) -> None:
+        """reconcile_order_state() must not overwrite a terminal local status."""
+        from kabu_hft.gateway import OrderSnapshot
+
+        local = WorkingOrderRecord(
+            order_id="T1",
+            symbol="9984",
+            side=1,
+            qty=100,
+            price=100.0,
+            status=OrderStatus.FILLED,
+            cum_qty=100,
+        )
+        # Broker sends a stale "partial" snapshot after local is already FILLED
+        broker = OrderSnapshot(
+            order_id="T1",
+            side=1,
+            order_qty=100,
+            cum_qty=50,
+            leaves_qty=50,
+            price=100.0,
+            avg_fill_price=100.0,
+            state_code=2,
+            order_state_code=2,
+            is_final=False,
+            raw={},
+        )
+        reconciled, _ = reconcile_order_state(local, broker)
+        self.assertEqual(reconciled.status, OrderStatus.FILLED)
+
 
 if __name__ == "__main__":
     unittest.main()
