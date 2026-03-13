@@ -398,6 +398,57 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["Exchange"], 27)
         self.assertEqual(body["ClosePositions"], [{"HoldID": "HOLD-27", "Qty": 100}])
 
+    async def test_margin_exit_retries_once_on_code8_and_prefers_hold_id(self) -> None:
+        sent_bodies: list[dict] = []
+
+        async def fake_request(_method, _path, **kwargs):
+            body = kwargs.get("json_body") or {}
+            sent_bodies.append(dict(body))
+            if len(sent_bodies) == 1:
+                raise KabuApiError(
+                    "POST /kabusapi/sendorder failed with status 500",
+                    status=500,
+                    payload={"Code": 8, "Message": "決済指定内容に誤りがあります"},
+                )
+            return {"OrderId": "ORDER-EXIT-RETRY"}
+
+        async def fake_positions(symbol=None, product=2):
+            _ = (symbol, product)
+            return [
+                {
+                    "HoldID": "HOLD-REAL",
+                    "ExecutionID": "EXEC-LEGACY",
+                    "Symbol": "9984",
+                    "Exchange": 27,
+                    "Side": "2",
+                    "HoldQty": 100,
+                    "Price": 1000,
+                    "MarginTradeType": 1,
+                }
+            ]
+
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+        client._request_json = fake_request  # type: ignore[method-assign]
+        client.get_positions = fake_positions  # type: ignore[method-assign]
+
+        result = await client.send_exit_order(
+            symbol="9984",
+            exchange=27,
+            position_side=1,
+            qty=100,
+            price=9980.0,
+            is_market=False,
+            profile=OrderProfile(mode="margin", margin_trade_type=3),
+        )
+
+        self.assertEqual(result.get("OrderId"), "ORDER-EXIT-RETRY")
+        self.assertEqual(len(sent_bodies), 2)
+        self.assertEqual(sent_bodies[0]["ClosePositions"], [{"HoldID": "HOLD-REAL", "Qty": 100}])
+        self.assertEqual(sent_bodies[1]["ClosePositions"], [{"HoldID": "HOLD-REAL", "Qty": 100}])
+        self.assertEqual(sent_bodies[0]["MarginTradeType"], 1)
+        self.assertEqual(sent_bodies[1]["MarginTradeType"], 1)
+
     async def test_ws_drops_duplicate_and_out_of_order_quote(self) -> None:
         board_events = []
         jst = timezone(timedelta(hours=9))

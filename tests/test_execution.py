@@ -288,6 +288,91 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(timed_out)
         self.assertIsNone(controller.working_order)
 
+    async def test_close_code8_enters_short_backoff(self) -> None:
+        class CloseCode8RestClient(DummyRestClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.exit_calls = 0
+
+            async def send_exit_order(self, **_kwargs) -> dict:
+                self.exit_calls += 1
+                raise KabuApiError(
+                    "POST /kabusapi/sendorder failed with status 500",
+                    status=500,
+                    payload={"Code": 8, "Message": "決済指定内容に誤りがあります"},
+                )
+
+            async def get_positions(self, symbol: str | None = None, product: int = 2) -> list[dict]:
+                _ = (symbol, product)
+                return [
+                    {
+                        "Symbol": "9984",
+                        "Side": "2",
+                        "HoldQty": 100,
+                        "Exchange": 27,
+                        "ExecutionID": "E-CLOSE-TEST",
+                        "Price": 100.0,
+                    }
+                ]
+
+        rest = CloseCode8RestClient()
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=27,
+            rest_client=rest,
+            order_profile=OrderProfile(mode="margin"),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+        controller.inventory.side = 1
+        controller.inventory.qty = 100
+        controller.inventory.avg_price = 100.0
+        controller.inventory.opened_ts_ns = 1
+
+        snapshot = BoardSnapshot(
+            symbol="9984",
+            exchange=27,
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=600,
+            ask_size=300,
+            last=100.5,
+            last_size=0,
+            volume=1_000,
+            vwap=100.5,
+            bids=(Level(100.0, 600),),
+            asks=(Level(101.0, 300),),
+            prev_board=None,
+        )
+
+        closed = await controller.close(
+            snapshot=snapshot,
+            score=-1.0,
+            reason="test_code8",
+            force=False,
+        )
+        self.assertFalse(closed)
+        self.assertEqual(rest.exit_calls, 1)
+
+        # Immediate retry should be blocked by local backoff.
+        closed_again = await controller.close(
+            snapshot=snapshot,
+            score=-1.0,
+            reason="test_code8_retry",
+            force=False,
+        )
+        self.assertFalse(closed_again)
+        self.assertEqual(rest.exit_calls, 1)
+
 
     async def test_queue_model_delays_fill_until_queue_consumed(self) -> None:
         controller = ExecutionController(
