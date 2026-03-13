@@ -234,6 +234,7 @@ class OrderSnapshot:
 class PositionLot:
     hold_id: str
     symbol: str
+    exchange: int
     side: int
     qty: int
     price: float
@@ -456,6 +457,7 @@ class KabuAdapter:
         return PositionLot(
             hold_id=hold_id,
             symbol=symbol,
+            exchange=_parse_int(raw.get("Exchange"), 1),
             side=_internal_side(raw.get("Side")),
             qty=qty,
             price=_parse_float(raw.get("Price") or raw.get("ExecutionPrice")),
@@ -658,7 +660,12 @@ class KabuRestClient:
                     "CashMargin": 3,
                     "MarginTradeType": profile.margin_trade_type,
                     "DelivType": profile.margin_close_deliv_type,
-                    "ClosePositions": await self._build_close_positions(symbol, position_side, qty),
+                    "ClosePositions": await self._build_close_positions(
+                        symbol=symbol,
+                        exchange=exchange,
+                        position_side=position_side,
+                        qty=qty,
+                    ),
                 }
             )
         else:
@@ -678,12 +685,20 @@ class KabuRestClient:
 
     async def _build_close_positions(
         self,
+        *,
         symbol: str,
+        exchange: int,
         position_side: int,
         qty: int,
     ) -> list[dict[str, Any]]:
         positions = [KabuAdapter.position_lot(raw) for raw in await self.get_positions(symbol)]
-        usable_positions = [pos for pos in positions if pos and pos.side == position_side]
+        usable_positions = [
+            pos
+            for pos in positions
+            if pos
+            and pos.side == position_side
+            and pos.exchange == exchange
+        ]
 
         remaining = qty
         close_positions: list[dict[str, Any]] = []
@@ -696,11 +711,12 @@ class KabuRestClient:
 
         if remaining > 0:
             raise KabuApiError(
-                f"not enough inventory to close {symbol} qty={qty}",
+                f"not enough inventory to close {symbol} exchange={exchange} qty={qty}",
                 payload=[
                     {
                         "hold_id": position.hold_id,
                         "symbol": position.symbol,
+                        "exchange": position.exchange,
                         "side": position.side,
                         "qty": position.qty,
                         "price": position.price,

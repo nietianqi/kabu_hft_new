@@ -238,6 +238,38 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(sent_bodies), 1)
 
+    async def test_margin_exit_uses_close_positions_for_matching_exchange(self) -> None:
+        captured: dict = {}
+
+        async def fake_request(_method, _path, **kwargs):
+            captured["json_body"] = kwargs.get("json_body")
+            return {"OrderId": "ORDER-EXIT-1"}
+
+        async def fake_positions(symbol=None, product=2):
+            _ = (symbol, product)
+            return [
+                {"ExecutionID": "HOLD-1", "Symbol": "9984", "Exchange": 1, "Side": "2", "LeavesQty": 100, "Price": 1000},
+                {"ExecutionID": "HOLD-27", "Symbol": "9984", "Exchange": 27, "Side": "2", "LeavesQty": 100, "Price": 1000},
+            ]
+
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+        client._request_json = fake_request  # type: ignore[method-assign]
+        client.get_positions = fake_positions  # type: ignore[method-assign]
+
+        await client.send_exit_order(
+            symbol="9984",
+            exchange=27,
+            position_side=1,
+            qty=100,
+            price=9980.0,
+            is_market=False,
+            profile=OrderProfile(mode="margin"),
+        )
+        body = captured["json_body"]
+        self.assertEqual(body["Exchange"], 27)
+        self.assertEqual(body["ClosePositions"], [{"HoldID": "HOLD-27", "Qty": 100}])
+
     async def test_ws_drops_duplicate_and_out_of_order_quote(self) -> None:
         board_events = []
         jst = timezone(timedelta(hours=9))
