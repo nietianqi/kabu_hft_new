@@ -426,8 +426,8 @@ class ExecutionController:
                 )
             except KabuApiError as exc:
                 if "not enough inventory" in str(exc):
-                    # ローカルの inventory が broker 側と乖離している。
-                    # API から実際のポジションを取得して同期し、無限ループを防ぐ。
+                    # 本地 inventory 与 broker 端出现偏差。
+                    # 从 API 获取实际持仓并同步，防止无限循环。
                     await self._sync_inventory_from_api()
                     return False
                 raise
@@ -687,9 +687,9 @@ class ExecutionController:
         self.working_order = None
 
     async def _sync_inventory_from_api(self) -> None:
-        """broker の実際のポジションから inventory.qty を再同期する。
-        close() で KabuApiError('not enough inventory') が発生した場合に呼び出し、
-        ローカル状態と broker 側のズレを解消して無限ループを防ぐ。
+        """从 broker 实际持仓中重新同步 inventory.qty。
+        在 close() 抛出 KabuApiError('not enough inventory') 时调用，
+        消除本地状态与 broker 端的偏差，防止无限循环。
         """
         if self.rest_client is None:
             logger.error("_sync_inventory_from_api: rest_client is None, cannot sync")
@@ -700,8 +700,8 @@ class ExecutionController:
             logger.error("_sync_inventory_from_api: get_positions failed: %s", exc)
             return
 
-        # kabu API: Side='2' → 買建て (long, internal side=+1)
-        #           Side='1' → 売建て (short, internal side=-1)
+        # kabu API: Side='2' → 买建（多头，内部 side=+1）
+        #           Side='1' → 卖建（空头，内部 side=-1）
         api_side_str = "2" if self.inventory.side == 1 else "1"
         available = sum(
             int(p.get("HoldQty") or 0)

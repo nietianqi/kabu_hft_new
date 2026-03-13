@@ -187,7 +187,7 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
                 raise KabuApiError(
                     "POST /kabusapi/sendorder failed with status 500",
                     status=500,
-                    payload={"Code": 100378, "Message": "現物買・売注文抑止エラー"},
+                    payload={"Code": 100378, "Message": "現物買・売注文抑止エラー"},  # 现货买卖订单抑制错误
                 )
             return {"OrderId": "ORDER-1"}
 
