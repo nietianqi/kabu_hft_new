@@ -3,16 +3,16 @@
   "api_password": "japan202303",
   "base_url": "http://localhost:18080",
   "ws_url": "ws://localhost:18080/kabusapi/websocket",
-  "dry_run": true,
+  "dry_run": false,
   "status_interval_s": 30,
   "journal_path": "trades.csv",
   "markout_seconds": 30,
   "rate_limit_per_second": 4.0,
-  "fail_on_startup_positions": true,
+  "fail_on_startup_positions": false,
   "startup_position_products": [0, 2],
   "shutdown_emergency_timeout_s": 5.0,
   "order_profile": {
-    "mode": "cash",
+    "mode": "margin",
     "allow_short": false,
     "account_type": 4,
     "cash_buy_fund_type": "02",
@@ -74,7 +74,7 @@
 
     {
       "symbol": "7269",
-      "exchange": 1,
+      "exchange": 27,
       "tick_size": 0.5,
       "base_qty": 100,
       "fixed_qty": 100,
@@ -85,7 +85,7 @@
     },
        {
       "symbol": "4680",
-      "exchange": 1,
+      "exchange": 27,
       "tick_size": 0.1,
       "base_qty": 100,
       "fixed_qty": 100,
@@ -96,7 +96,7 @@
     },
        {
       "symbol": "9616",
-      "exchange": 1,
+      "exchange": 27,
       "tick_size": 0.5,
       "base_qty": 100,
       "fixed_qty": 100,
