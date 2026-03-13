@@ -83,6 +83,8 @@ _MARGIN_MODES: frozenset[str] = frozenset(
     }
 )
 
+_TSE_PLUS_RETRY_CODES: frozenset[int] = frozenset({100368, 100378})
+
 
 def _is_margin_mode(mode: str) -> bool:
     normalized = str(mode or "").strip().lower()
@@ -93,6 +95,55 @@ def _is_margin_mode(mode: str) -> bool:
     raise ValueError(
         f"unsupported order_profile.mode={mode!r}; expected one of cash/spot/margin variants"
     )
+
+
+def _extract_error_code(payload: Any) -> int | None:
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("Code"),
+                payload.get("ResultCode"),
+                payload.get("code"),
+                payload.get("result_code"),
+            ]
+        )
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                candidates.extend(
+                    [
+                        item.get("Code"),
+                        item.get("ResultCode"),
+                        item.get("code"),
+                        item.get("result_code"),
+                    ]
+                )
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_error_message(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("Message", "Result", "message", "result"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return str(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            for key in ("Message", "Result", "message", "result"):
+                value = item.get(key)
+                if value not in (None, ""):
+                    return str(value)
+    return None
 
 
 @dataclass(slots=True)
@@ -183,6 +234,7 @@ class OrderSnapshot:
 class PositionLot:
     hold_id: str
     symbol: str
+    exchange: int
     side: int
     qty: int
     price: float
@@ -193,6 +245,19 @@ class KabuApiError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.payload = payload
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        code = _extract_error_code(self.payload)
+        message = _extract_error_message(self.payload)
+        suffix_parts: list[str] = []
+        if code is not None:
+            suffix_parts.append(f"code={code}")
+        if message:
+            suffix_parts.append(f"message={message}")
+        if suffix_parts:
+            return f"{base} ({', '.join(suffix_parts)})"
+        return base
 
 
 class KabuAdapter:
@@ -386,12 +451,13 @@ class KabuAdapter:
     def position_lot(raw: dict[str, Any]) -> PositionLot | None:
         hold_id = str(raw.get("ExecutionID") or raw.get("HoldID") or "")
         symbol = str(raw.get("Symbol") or "")
-        qty = _parse_int(raw.get("LeavesQty") or raw.get("HoldQty") or raw.get("Qty"))
+        qty = _parse_int(raw.get("HoldQty") or raw.get("LeavesQty") or raw.get("Qty"))
         if not hold_id or not symbol or qty <= 0:
             return None
         return PositionLot(
             hold_id=hold_id,
             symbol=symbol,
+            exchange=_parse_int(raw.get("Exchange"), 1),
             side=_internal_side(raw.get("Side")),
             qty=qty,
             price=_parse_float(raw.get("Price") or raw.get("ExecutionPrice")),
@@ -478,6 +544,35 @@ class KabuRestClient:
             json_body={"OrderId": order_id, "Password": self._password or ""},
         )
 
+    @staticmethod
+    def _is_tse_plus_retry_error(exc: KabuApiError) -> bool:
+        if exc.status not in {400, 500}:
+            return False
+        code = _extract_error_code(exc.payload)
+        return code in _TSE_PLUS_RETRY_CODES
+
+    async def _sendorder_with_exchange_retry(
+        self,
+        *,
+        symbol: str,
+        exchange: int,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return await self._request_json("POST", "/kabusapi/sendorder", json_body=body)
+        except KabuApiError as exc:
+            if exchange != 1 or not self._is_tse_plus_retry_error(exc):
+                raise
+            retry_body = dict(body)
+            retry_body["Exchange"] = 27
+            code = _extract_error_code(exc.payload)
+            logger.warning(
+                "sendorder rejected on exchange=1 symbol=%s code=%s; retrying exchange=27 (東証+)",
+                symbol,
+                code,
+            )
+            return await self._request_json("POST", "/kabusapi/sendorder", json_body=retry_body)
+
     async def send_entry_order(
         self,
         *,
@@ -525,7 +620,11 @@ class KabuRestClient:
                 }
             )
 
-        return await self._request_json("POST", "/kabusapi/sendorder", json_body=body)
+        return await self._sendorder_with_exchange_retry(
+            symbol=symbol,
+            exchange=exchange,
+            body=body,
+        )
 
     async def send_exit_order(
         self,
@@ -561,7 +660,12 @@ class KabuRestClient:
                     "CashMargin": 3,
                     "MarginTradeType": profile.margin_trade_type,
                     "DelivType": profile.margin_close_deliv_type,
-                    "ClosePositions": await self._build_close_positions(symbol, position_side, qty),
+                    "ClosePositions": await self._build_close_positions(
+                        symbol=symbol,
+                        exchange=exchange,
+                        position_side=position_side,
+                        qty=qty,
+                    ),
                 }
             )
         else:
@@ -573,16 +677,28 @@ class KabuRestClient:
                 }
             )
 
-        return await self._request_json("POST", "/kabusapi/sendorder", json_body=body)
+        return await self._sendorder_with_exchange_retry(
+            symbol=symbol,
+            exchange=exchange,
+            body=body,
+        )
 
     async def _build_close_positions(
         self,
+        *,
         symbol: str,
+        exchange: int,
         position_side: int,
         qty: int,
     ) -> list[dict[str, Any]]:
         positions = [KabuAdapter.position_lot(raw) for raw in await self.get_positions(symbol)]
-        usable_positions = [pos for pos in positions if pos and pos.side == position_side]
+        usable_positions = [
+            pos
+            for pos in positions
+            if pos
+            and pos.side == position_side
+            and pos.exchange == exchange
+        ]
 
         remaining = qty
         close_positions: list[dict[str, Any]] = []
@@ -595,11 +711,12 @@ class KabuRestClient:
 
         if remaining > 0:
             raise KabuApiError(
-                f"not enough inventory to close {symbol} qty={qty}",
+                f"not enough inventory to close {symbol} exchange={exchange} qty={qty}",
                 payload=[
                     {
                         "hold_id": position.hold_id,
                         "symbol": position.symbol,
+                        "exchange": position.exchange,
                         "side": position.side,
                         "qty": position.qty,
                         "price": position.price,

@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from kabu_hft.config import OrderProfile
-from kabu_hft.gateway import KabuAdapter, KabuRestClient, KabuWebSocket
+from kabu_hft.gateway import KabuAdapter, KabuApiError, KabuRestClient, KabuWebSocket
 
 
 class GatewayAdapterTests(unittest.TestCase):
@@ -176,6 +176,99 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
                 is_market=False,
                 profile=OrderProfile(mode="marginn"),
             )
+
+    async def test_sendorder_retries_exchange_27_on_tse_plus_suppression(self) -> None:
+        sent_bodies: list[dict] = []
+
+        async def fake_request(_method, _path, **kwargs):
+            body = kwargs.get("json_body") or {}
+            sent_bodies.append(dict(body))
+            if body.get("Exchange") == 1:
+                raise KabuApiError(
+                    "POST /kabusapi/sendorder failed with status 500",
+                    status=500,
+                    payload={"Code": 100378, "Message": "現物買・売注文抑止エラー"},
+                )
+            return {"OrderId": "ORDER-1"}
+
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+        client._request_json = fake_request  # type: ignore[method-assign]
+
+        result = await client.send_entry_order(
+            symbol="9984",
+            exchange=1,
+            side=1,
+            qty=100,
+            price=9980.0,
+            is_market=False,
+            profile=OrderProfile(mode="cash"),
+        )
+
+        self.assertEqual(result.get("OrderId"), "ORDER-1")
+        self.assertEqual(len(sent_bodies), 2)
+        self.assertEqual(sent_bodies[0].get("Exchange"), 1)
+        self.assertEqual(sent_bodies[1].get("Exchange"), 27)
+
+    async def test_sendorder_does_not_retry_on_non_tse_plus_error(self) -> None:
+        sent_bodies: list[dict] = []
+
+        async def fake_request(_method, _path, **kwargs):
+            body = kwargs.get("json_body") or {}
+            sent_bodies.append(dict(body))
+            raise KabuApiError(
+                "POST /kabusapi/sendorder failed with status 400",
+                status=400,
+                payload={"Code": 4001002, "Message": "invalid param"},
+            )
+
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+        client._request_json = fake_request  # type: ignore[method-assign]
+
+        with self.assertRaises(KabuApiError):
+            await client.send_entry_order(
+                symbol="9984",
+                exchange=1,
+                side=1,
+                qty=100,
+                price=9980.0,
+                is_market=False,
+                profile=OrderProfile(mode="cash"),
+            )
+        self.assertEqual(len(sent_bodies), 1)
+
+    async def test_margin_exit_uses_close_positions_for_matching_exchange(self) -> None:
+        captured: dict = {}
+
+        async def fake_request(_method, _path, **kwargs):
+            captured["json_body"] = kwargs.get("json_body")
+            return {"OrderId": "ORDER-EXIT-1"}
+
+        async def fake_positions(symbol=None, product=2):
+            _ = (symbol, product)
+            return [
+                {"ExecutionID": "HOLD-1", "Symbol": "9984", "Exchange": 1, "Side": "2", "LeavesQty": 100, "Price": 1000},
+                {"ExecutionID": "HOLD-27", "Symbol": "9984", "Exchange": 27, "Side": "2", "LeavesQty": 100, "Price": 1000},
+            ]
+
+        client = KabuRestClient("http://localhost:18080")
+        client._password = "abc123"  # type: ignore[attr-defined]
+        client._request_json = fake_request  # type: ignore[method-assign]
+        client.get_positions = fake_positions  # type: ignore[method-assign]
+
+        await client.send_exit_order(
+            symbol="9984",
+            exchange=27,
+            position_side=1,
+            qty=100,
+            price=9980.0,
+            is_market=False,
+            profile=OrderProfile(mode="margin"),
+        )
+        body = captured["json_body"]
+        self.assertEqual(body["Exchange"], 27)
+        self.assertEqual(body["ClosePositions"], [{"HoldID": "HOLD-27", "Qty": 100}])
 
     async def test_ws_drops_duplicate_and_out_of_order_quote(self) -> None:
         board_events = []

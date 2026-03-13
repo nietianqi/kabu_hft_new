@@ -36,6 +36,22 @@ class AppRegistrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app._build_register_symbols()
 
+    def test_register_payload_normalizes_tse_plus_and_sor_to_tse(self) -> None:
+        app = KabuHFTApp(load_config(None))
+        app.strategies = {
+            ("7269", 27): _fake_strategy("7269", 27),
+            ("7269", 1): _fake_strategy("7269", 1),
+            ("9616", 9): _fake_strategy("9616", 9),
+        }
+        payload = app._build_register_symbols()
+        self.assertEqual(
+            payload,
+            [
+                {"Symbol": "7269", "Exchange": 1},
+                {"Symbol": "9616", "Exchange": 1},
+            ],
+        )
+
     def test_find_strategy_uses_exact_symbol_exchange(self) -> None:
         app = KabuHFTApp(load_config(None))
         exact = _fake_strategy("9984", 3)
