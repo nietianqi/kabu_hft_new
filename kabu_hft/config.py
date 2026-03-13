@@ -283,7 +283,7 @@ def load_config(path: str | Path | None) -> AppConfig:
                 cooling_seconds=int(merged.get("cooling_seconds", 300)),
                 consecutive_loss_limit=int(merged.get("consecutive_loss_limit", 3)),
                 max_spread_ticks=float(merged.get("max_spread_ticks", 3.0)),
-                stale_quote_ms=int(merged.get("stale_quote_ms", 1200)),
+                stale_quote_ms=int(merged.get("stale_quote_ms", 2000)),
                 poll_interval_ms=int(merged.get("poll_interval_ms", 350)),
                 min_board_interval_ms=float(merged.get("min_board_interval_ms", 8.0)),
                 queue_spread_max_ticks=float(merged.get("queue_spread_max_ticks", 1.0)),
