@@ -281,6 +281,12 @@ class ExecutionController:
         self.paper_last_fill_reason = ""
         self.has_stranded_partial: bool = False
         self._exit_blocked_until_ns: int = 0
+        self._last_position_sync_ns: int = 0
+        self._position_sync_interval_ns: int = 1_000_000_000
+        self._manual_close_lock: bool = False
+        self.has_external_inventory: bool = False
+        self.broker_hold_qty: int = 0
+        self.broker_closable_qty: int = 0
         self._order_ledger = OrderLedger()
         self.stats = {
             "sent_orders": 0,
@@ -305,6 +311,9 @@ class ExecutionController:
     @property
     def has_inventory(self) -> bool:
         return self.inventory.qty > 0
+
+    def has_external_inventory_conflict(self) -> bool:
+        return self.has_external_inventory or self._manual_close_lock
 
     def working_age_ns(self, now_ns: int) -> int:
         if self.working_order is None:
@@ -678,6 +687,10 @@ class ExecutionController:
             "inventory_side": self.inventory.side,
             "inventory_qty": self.inventory.qty,
             "inventory_price": self.inventory.avg_price,
+            "broker_hold_qty": self.broker_hold_qty,
+            "broker_closable_qty": self.broker_closable_qty,
+            "manual_close_lock": self._manual_close_lock,
+            "external_inventory": self.has_external_inventory,
             "working_order_id": self.current_order_id,
             "working_order_side": self.working_order.side if self.working_order else 0,
             "working_order_price": self.working_order.price if self.working_order else 0.0,
@@ -790,7 +803,124 @@ class ExecutionController:
         )
         self.working_order = None
 
+    @staticmethod
+    def _position_side_totals(positions: list[dict], *, symbol: str, side: str) -> tuple[int, int]:
+        hold_qty = 0
+        closable_qty = 0
+        for position in positions:
+            if str(position.get("Symbol")) != str(symbol) or str(position.get("Side")) != side:
+                continue
+            leaves_raw = position.get("LeavesQty")
+            hold = int(float(leaves_raw if leaves_raw not in (None, "") else (position.get("Qty") or 0)))
+            locked = int(float(position.get("HoldQty") or 0))
+            closable_raw = position.get("ClosableQty")
+            closable = int(float(closable_raw)) if closable_raw not in (None, "") else max(hold - locked, 0)
+            hold_qty += hold
+            closable_qty += max(closable, 0)
+        return hold_qty, closable_qty
+
+    async def sync_broker_position(self, *, force: bool = False) -> None:
+        if self.rest_client is None:
+            logger.error("sync_broker_position: rest_client is None, cannot sync")
+            return
+
+        now_ns = self._clock.time_ns()
+        if not force and now_ns - self._last_position_sync_ns < self._position_sync_interval_ns:
+            return
+        self._last_position_sync_ns = now_ns
+
+        try:
+            positions = await self.rest_client.get_positions(self.symbol)
+        except Exception as exc:
+            logger.error("sync_broker_position: get_positions failed: %s", exc)
+            return
+
+        long_hold, long_closable = self._position_side_totals(positions, symbol=self.symbol, side="2")
+        short_hold, short_closable = self._position_side_totals(positions, symbol=self.symbol, side="1")
+
+        if self.inventory.side > 0:
+            broker_hold_qty = long_hold
+            broker_closable_qty = long_closable
+        elif self.inventory.side < 0:
+            broker_hold_qty = short_hold
+            broker_closable_qty = short_closable
+        else:
+            broker_hold_qty = long_hold + short_hold
+            broker_closable_qty = long_closable + short_closable
+
+        self.broker_hold_qty = broker_hold_qty
+        self.broker_closable_qty = broker_closable_qty
+
+        if self.inventory.qty == 0:
+            has_external = broker_hold_qty > 0
+            if has_external and not self.has_external_inventory:
+                logger.warning(
+                    "external inventory detected symbol=%s broker_hold=%d broker_closable=%d; blocking new entries until manual position is cleared",
+                    self.symbol,
+                    broker_hold_qty,
+                    broker_closable_qty,
+                )
+            elif not has_external and self.has_external_inventory:
+                logger.info("external inventory cleared symbol=%s", self.symbol)
+            self.has_external_inventory = has_external
+            self._manual_close_lock = False
+            if not has_external:
+                self._exit_blocked_until_ns = 0
+            return
+
+        if self.working_order is None and broker_hold_qty == 0:
+            logger.warning(
+                "broker position disappeared symbol=%s local_qty=%d; resetting local inventory (manual close likely)",
+                self.symbol,
+                self.inventory.qty,
+            )
+            self.has_external_inventory = False
+            self._manual_close_lock = False
+            self._exit_blocked_until_ns = 0
+            self._reset_inventory()
+            self.broker_hold_qty = 0
+            self.broker_closable_qty = 0
+            return
+
+        qty_mismatch = broker_hold_qty != self.inventory.qty
+        if qty_mismatch and self.working_order is None:
+            if not self.has_external_inventory:
+                logger.warning(
+                    "broker inventory drift symbol=%s local_qty=%d broker_hold=%d broker_closable=%d; manual intervention assumed",
+                    self.symbol,
+                    self.inventory.qty,
+                    broker_hold_qty,
+                    broker_closable_qty,
+                )
+            self.has_external_inventory = True
+            self._exit_blocked_until_ns = max(self._exit_blocked_until_ns, now_ns + 15_000_000_000)
+        else:
+            self.has_external_inventory = False
+
+        locked = broker_hold_qty > 0 and broker_closable_qty < min(broker_hold_qty, self.inventory.qty)
+        if locked and not self._manual_close_lock:
+            logger.warning(
+                "close inventory locked symbol=%s hold=%d closable=%d; external/manual repayment order is likely working",
+                self.symbol,
+                broker_hold_qty,
+                broker_closable_qty,
+            )
+        elif not locked and self._manual_close_lock:
+            logger.info(
+                "close inventory lock cleared symbol=%s hold=%d closable=%d",
+                self.symbol,
+                broker_hold_qty,
+                broker_closable_qty,
+            )
+        self._manual_close_lock = locked
+        if locked:
+            self._exit_blocked_until_ns = max(self._exit_blocked_until_ns, now_ns + 15_000_000_000)
+        elif not self.has_external_inventory:
+            self._exit_blocked_until_ns = 0
+
     async def _sync_inventory_from_api(self) -> None:
+        await self.sync_broker_position(force=True)
+        return
         """从 broker 实际持仓中重新同步 inventory.qty。
         在 close() 抛出 KabuApiError('not enough inventory') 时调用，
         消除本地状态与 broker 端的偏差，防止无限循环。

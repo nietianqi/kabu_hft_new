@@ -421,7 +421,8 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
                     "Symbol": "9984",
                     "Exchange": 27,
                     "Side": "2",
-                    "HoldQty": 100,
+                    "LeavesQty": 100,
+                    "HoldQty": 0,
                     "Price": 1000,
                     "MarginTradeType": 1,
                 }
@@ -448,6 +449,24 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[1]["ClosePositions"], [{"HoldID": "HOLD-REAL", "Qty": 100}])
         self.assertEqual(sent_bodies[0]["MarginTradeType"], 1)
         self.assertEqual(sent_bodies[1]["MarginTradeType"], 1)
+
+    def test_position_lot_uses_leaves_qty_for_inventory(self) -> None:
+        lot = KabuAdapter.position_lot(
+            {
+                "HoldID": "HOLD-REAL",
+                "Symbol": "6532",
+                "Exchange": 27,
+                "Side": "2",
+                "LeavesQty": 100,
+                "HoldQty": 0,
+                "Price": 4331.0,
+            }
+        )
+
+        self.assertIsNotNone(lot)
+        assert lot is not None
+        self.assertEqual(lot.qty, 100)
+        self.assertEqual(lot.closable_qty, 100)
 
     async def test_ws_drops_duplicate_and_out_of_order_quote(self) -> None:
         board_events = []

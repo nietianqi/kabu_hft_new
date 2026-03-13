@@ -479,13 +479,14 @@ class KabuAdapter:
         # Prefer broker-native HoldID when available; fall back to ExecutionID for older responses.
         hold_id = str(raw.get("HoldID") or raw.get("ExecutionID") or "")
         symbol = str(raw.get("Symbol") or "")
-        _hold = raw.get("HoldQty")
         _leaves = raw.get("LeavesQty")
-        qty = _parse_int(_hold if _hold is not None else (_leaves if _leaves is not None else raw.get("Qty")))
+        _hold = raw.get("HoldQty")
+        qty = _parse_int(_leaves if _leaves is not None else raw.get("Qty"))
         if not hold_id or not symbol or qty <= 0:
             return None
         closable = raw.get("ClosableQty")
-        closable_qty = _parse_int(closable) if closable is not None else qty
+        locked_qty = _parse_int(_hold) if _hold is not None else 0
+        closable_qty = _parse_int(closable) if closable is not None else max(qty - locked_qty, 0)
         return PositionLot(
             hold_id=hold_id,
             symbol=symbol,

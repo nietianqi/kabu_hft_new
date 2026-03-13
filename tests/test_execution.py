@@ -308,7 +308,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "Symbol": "9984",
                         "Side": "2",
-                        "HoldQty": 100,
+                        "LeavesQty": 100,
+                        "HoldQty": 0,
                         "Exchange": 27,
                         "ExecutionID": "E-CLOSE-TEST",
                         "Price": 100.0,
@@ -372,6 +373,170 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(closed_again)
         self.assertEqual(rest.exit_calls, 1)
+
+    async def test_sync_broker_position_resets_local_inventory_after_manual_close(self) -> None:
+        class FlatBrokerRestClient(DummyRestClient):
+            async def get_positions(self, symbol: str | None = None, product: int = 2) -> list[dict]:
+                _ = (symbol, product)
+                return []
+
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=27,
+            rest_client=FlatBrokerRestClient(),
+            order_profile=OrderProfile(mode="margin"),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+        controller.inventory.side = 1
+        controller.inventory.qty = 100
+        controller.inventory.avg_price = 100.0
+        controller.inventory.opened_ts_ns = 1
+
+        await controller.sync_broker_position(force=True)
+
+        self.assertEqual(controller.inventory.qty, 0)
+        self.assertEqual(controller.state, ExecutionState.FLAT)
+        self.assertEqual(controller.broker_hold_qty, 0)
+        self.assertFalse(controller.has_external_inventory)
+
+    async def test_sync_broker_position_detects_external_inventory_when_local_flat(self) -> None:
+        class ExternalInventoryRestClient(DummyRestClient):
+            async def get_positions(self, symbol: str | None = None, product: int = 2) -> list[dict]:
+                _ = (symbol, product)
+                return [
+                    {
+                        "Symbol": "9984",
+                        "Side": "2",
+                        "LeavesQty": 200,
+                        "HoldQty": 0,
+                        "ClosableQty": 200,
+                        "Exchange": 27,
+                        "ExecutionID": "E-EXT-1",
+                        "Price": 100.0,
+                    }
+                ]
+
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=27,
+            rest_client=ExternalInventoryRestClient(),
+            order_profile=OrderProfile(mode="margin"),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+
+        await controller.sync_broker_position(force=True)
+
+        self.assertTrue(controller.has_external_inventory)
+        self.assertTrue(controller.has_external_inventory_conflict())
+        self.assertEqual(controller.broker_hold_qty, 200)
+        self.assertEqual(controller.broker_closable_qty, 200)
+
+    async def test_sync_broker_position_detects_manual_close_lock(self) -> None:
+        class LockedInventoryRestClient(DummyRestClient):
+            async def get_positions(self, symbol: str | None = None, product: int = 2) -> list[dict]:
+                _ = (symbol, product)
+                return [
+                    {
+                        "Symbol": "9984",
+                        "Side": "2",
+                        "LeavesQty": 100,
+                        "HoldQty": 100,
+                        "ClosableQty": 0,
+                        "Exchange": 27,
+                        "ExecutionID": "E-LOCK-1",
+                        "Price": 100.0,
+                    }
+                ]
+
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=27,
+            rest_client=LockedInventoryRestClient(),
+            order_profile=OrderProfile(mode="margin"),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+        controller.inventory.side = 1
+        controller.inventory.qty = 100
+        controller.inventory.avg_price = 100.0
+        controller.inventory.opened_ts_ns = 1
+
+        await controller.sync_broker_position(force=True)
+
+        self.assertEqual(controller.broker_hold_qty, 100)
+        self.assertEqual(controller.broker_closable_qty, 0)
+        self.assertTrue(controller.has_external_inventory_conflict())
+
+    async def test_sync_broker_position_uses_leavesqty_as_actual_inventory(self) -> None:
+        class UnlockedInventoryRestClient(DummyRestClient):
+            async def get_positions(self, symbol: str | None = None, product: int = 2) -> list[dict]:
+                _ = (symbol, product)
+                return [
+                    {
+                        "Symbol": "6532",
+                        "Side": "2",
+                        "LeavesQty": 100,
+                        "HoldQty": 0,
+                        "Exchange": 27,
+                        "ExecutionID": "E-6532-OPEN",
+                        "Price": 4331.0,
+                    }
+                ]
+
+        controller = ExecutionController(
+            symbol="6532",
+            exchange=27,
+            rest_client=UnlockedInventoryRestClient(),
+            order_profile=OrderProfile(mode="margin"),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+        controller.inventory.side = 1
+        controller.inventory.qty = 100
+        controller.inventory.avg_price = 4331.0
+        controller.inventory.opened_ts_ns = 1
+
+        await controller.sync_broker_position(force=True)
+
+        self.assertEqual(controller.inventory.qty, 100)
+        self.assertEqual(controller.broker_hold_qty, 100)
+        self.assertEqual(controller.broker_closable_qty, 100)
+        self.assertEqual(controller.state, ExecutionState.OPEN)
+        self.assertFalse(controller.has_external_inventory_conflict())
 
 
     async def test_queue_model_delays_fill_until_queue_consumed(self) -> None:
