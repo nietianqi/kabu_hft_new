@@ -31,7 +31,7 @@ class OnlineZScore:
             self.sum_x2 -= removed * removed
 
         count = len(self.buf)
-        if count < 50:
+        if count < min(50, self.window):
             return 0.0
 
         mean = self.sum_x / count
