@@ -284,17 +284,60 @@ class HFTStrategy:
                 now_ns=now_ns,
                 now_dt=now_dt,
             )
+            if must_close:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason=reason or "risk_close",
+                    force=True,
+                )
+                return
+
+            pnl_ticks = self._unrealized_ticks(snapshot)
+            hold_ms = 0.0
+            if self.execution.inventory.opened_ts_ns > 0:
+                hold_ms = max(0.0, (now_ns - self.execution.inventory.opened_ts_ns) / 1_000_000)
+
+            take_profit_triggered = (
+                self.config.take_profit_ticks > 0.0
+                and pnl_ticks >= self.config.take_profit_ticks
+                and hold_ms >= max(self.config.take_profit_min_hold_ms, 0)
+            )
+            stop_loss_triggered = (
+                not self.config.disable_stop_loss
+                and self.config.stop_loss_ticks > 0.0
+                and pnl_ticks <= -self.config.stop_loss_ticks
+            )
+
+            if take_profit_triggered:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason="take_profit",
+                    force=True,
+                )
+                return
+
+            if stop_loss_triggered:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason="stop_loss",
+                    force=True,
+                )
+                return
+
             signal_reversed = (
                 self.execution.inventory.side > 0 and score <= -self.config.exit_threshold
             ) or (
                 self.execution.inventory.side < 0 and score >= self.config.exit_threshold
             )
-            if must_close or signal_reversed:
+            if signal_reversed:
                 await self.execution.close(
                     snapshot=snapshot,
                     score=score,
-                    reason=reason or "signal_reverse",
-                    force=must_close or abs(score) >= self.config.strong_threshold,
+                    reason="signal_reverse",
+                    force=abs(score) >= self.config.strong_threshold,
                 )
             return
 
@@ -363,6 +406,15 @@ class HFTStrategy:
         if market_state is MarketState.ABNORMAL:
             return QuoteMode.CLOSE_ONLY
         return QuoteMode.PASSIVE_FAIR_VALUE
+
+    def _unrealized_ticks(self, snapshot: BoardSnapshot) -> float:
+        inv = self.execution.inventory
+        if inv.qty <= 0 or inv.side == 0 or inv.avg_price <= 0:
+            return 0.0
+        tick = max(self.config.tick_size, 1e-9)
+        if inv.side > 0:
+            return (snapshot.bid - inv.avg_price) / tick
+        return (inv.avg_price - snapshot.ask) / tick
 
     def _queue_threshold(self, snapshot: BoardSnapshot, signal_strength: float) -> int:
         base = max(self.config.queue_min_top_qty, 1)

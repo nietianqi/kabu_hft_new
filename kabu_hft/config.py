@@ -49,6 +49,10 @@ DEFAULT_CONFIG: dict = {
         "zscore_window": 300,
         "mp_ema_alpha": 0.10,
         "max_hold_seconds": 45,
+        "take_profit_ticks": 1.0,
+        "take_profit_min_hold_ms": 300,
+        "stop_loss_ticks": 1.5,
+        "disable_stop_loss": False,
         "max_pending_ms": 2500,
         "min_order_lifetime_ms": 250,
         "min_edge_ticks": 0.25,
@@ -196,6 +200,10 @@ class StrategyConfig:
     zscore_window: int
     mp_ema_alpha: float
     max_hold_seconds: int
+    take_profit_ticks: float
+    take_profit_min_hold_ms: int
+    stop_loss_ticks: float
+    disable_stop_loss: bool
     max_pending_ms: int
     min_order_lifetime_ms: int
     min_edge_ticks: float
@@ -277,6 +285,10 @@ def load_config(path: str | Path | None) -> AppConfig:
                 zscore_window=int(merged.get("zscore_window", 300)),
                 mp_ema_alpha=float(merged.get("mp_ema_alpha", 0.10)),
                 max_hold_seconds=int(merged.get("max_hold_seconds", 45)),
+                take_profit_ticks=float(merged.get("take_profit_ticks", 1.0)),
+                take_profit_min_hold_ms=int(merged.get("take_profit_min_hold_ms", 300)),
+                stop_loss_ticks=float(merged.get("stop_loss_ticks", 1.5)),
+                disable_stop_loss=bool(merged.get("disable_stop_loss", False)),
                 max_pending_ms=int(merged.get("max_pending_ms", 2500)),
                 min_order_lifetime_ms=int(merged.get("min_order_lifetime_ms", 250)),
                 min_edge_ticks=float(merged.get("min_edge_ticks", 0.25)),

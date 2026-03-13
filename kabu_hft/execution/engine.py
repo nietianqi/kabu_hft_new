@@ -17,6 +17,38 @@ from kabu_hft.oms.reconciliation import reconcile_order_state
 logger = logging.getLogger("kabu.execution")
 
 
+def _extract_error_code(payload: object) -> int | None:
+    candidates: list[object] = []
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("Code"),
+                payload.get("ResultCode"),
+                payload.get("code"),
+                payload.get("result_code"),
+            ]
+        )
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                candidates.extend(
+                    [
+                        item.get("Code"),
+                        item.get("ResultCode"),
+                        item.get("code"),
+                        item.get("result_code"),
+                    ]
+                )
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 class ExecutionState(str, Enum):
     FLAT = "FLAT"
     OPENING = "OPENING"
@@ -484,7 +516,29 @@ class ExecutionController:
         else:
             if self.rest_client is None:
                 raise RuntimeError("rest_client is required for live trading (dry_run=False)")
-            await self.rest_client.cancel_order(order_id)
+            try:
+                await self.rest_client.cancel_order(order_id)
+            except KabuApiError as exc:
+                error_code = _extract_error_code(exc.payload)
+                if exc.status == 500 and error_code == 43:
+                    # kabu: cancel can race with exchange fill and return code=43
+                    # ("already filled"). Treat as idempotent success and wait for
+                    # reconcile to finalize local order state.
+                    self.stats["cancel_orders"] += 1
+                    logger.info(
+                        "cancel ignored symbol=%s order_id=%s code=43 already_filled reason=%s",
+                        self.symbol,
+                        order_id,
+                        reason,
+                    )
+                    return True
+                if self.working_order is not None and self.working_order.order_id == order_id:
+                    self.working_order.cancel_requested = False
+                raise
+            except Exception:
+                if self.working_order is not None and self.working_order.order_id == order_id:
+                    self.working_order.cancel_requested = False
+                raise
         self.stats["cancel_orders"] += 1
         logger.info("cancel requested symbol=%s order_id=%s reason=%s", self.symbol, order_id, reason)
         return True

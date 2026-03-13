@@ -107,6 +107,65 @@ class GatewayAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot.ts_ns, 0)
         self.assertEqual(snapshot.ts_source, "no_exchange_time")
 
+    def test_order_snapshot_does_not_infer_cum_qty_from_non_fill_details(self) -> None:
+        raw = {
+            "ID": "ORDER-1",
+            "State": 2,
+            "OrderState": 2,
+            "Side": "2",
+            "OrderQty": 100,
+            "CumQty": 0,
+            "Price": 1000.0,
+            "Details": [
+                {
+                    "RecType": 1,  # new/accepted record, not an execution fill
+                    "Qty": 100,
+                    "Price": 1000.0,
+                    "ExecutionID": "",
+                    "ExecutionDay": "2026-03-13T10:00:00+09:00",
+                }
+            ],
+        }
+        snapshot = KabuAdapter.order_snapshot(raw)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.cum_qty, 0)
+        self.assertEqual(snapshot.avg_fill_price, 0.0)
+        self.assertEqual(snapshot.status, "working")
+
+    def test_order_snapshot_uses_fill_details_for_average_price(self) -> None:
+        raw = {
+            "ID": "ORDER-2",
+            "State": 3,
+            "OrderState": 3,
+            "Side": "2",
+            "OrderQty": 100,
+            "CumQty": 80,
+            "Price": 1000.0,
+            "Details": [
+                {
+                    "RecType": 8,
+                    "Qty": 50,
+                    "Price": 1001.0,
+                    "ExecutionID": "E1",
+                    "ExecutionDay": "2026-03-13T10:00:00+09:00",
+                },
+                {
+                    "RecType": 8,
+                    "Qty": 30,
+                    "Price": 1002.0,
+                    "ExecutionID": "E2",
+                    "ExecutionDay": "2026-03-13T10:00:01+09:00",
+                },
+            ],
+        }
+        snapshot = KabuAdapter.order_snapshot(raw)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.cum_qty, 80)
+        self.assertAlmostEqual(snapshot.avg_fill_price, (50 * 1001.0 + 30 * 1002.0) / 80)
+        self.assertGreater(snapshot.fill_ts_ns, 0)
+
 
 class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_json_does_not_retry_order_mutation_500(self) -> None:
