@@ -78,6 +78,45 @@ class OmsTests(unittest.TestCase):
         ledger.mark_filled("A2")
         self.assertEqual(ledger.get("A2").status, OrderStatus.FILLED)  # type: ignore[union-attr]
 
+    def test_add_duplicate_order_id_warns_and_overwrites(self) -> None:
+        """add() must warn on duplicate order_id but still accept the new record."""
+        import logging
+        ledger = OrderLedger()
+        r1 = WorkingOrderRecord(order_id="DUP", symbol="9984", side=1, qty=100, price=100.0)
+        r2 = WorkingOrderRecord(order_id="DUP", symbol="9984", side=1, qty=200, price=101.0)
+        ledger.add(r1)
+        with self.assertLogs("kabu.oms", level=logging.WARNING):
+            ledger.add(r2)
+        self.assertEqual(ledger.get("DUP").qty, 200)  # type: ignore[union-attr]
+
+    def test_mark_rejected_does_not_overwrite_filled(self) -> None:
+        """mark_rejected() must not downgrade a terminal FILLED status."""
+        ledger = OrderLedger()
+        r = WorkingOrderRecord(order_id="B1", symbol="9984", side=1, qty=100, price=100.0)
+        ledger.add(r)
+        ledger.mark_working("B1")
+        ledger.apply_fill("B1", fill_qty=100, fill_price=100.0)
+        self.assertEqual(ledger.get("B1").status, OrderStatus.FILLED)  # type: ignore[union-attr]
+        ledger.mark_rejected("B1")  # must be a no-op now
+        self.assertEqual(ledger.get("B1").status, OrderStatus.FILLED)  # type: ignore[union-attr]
+
+    def test_mark_filled_does_not_overwrite_canceled(self) -> None:
+        """mark_filled() must not overwrite a terminal CANCELED status."""
+        ledger = OrderLedger()
+        r = WorkingOrderRecord(order_id="C1", symbol="9984", side=1, qty=100, price=100.0)
+        ledger.add(r)
+        ledger.mark_working("C1")
+        ledger.mark_canceled("C1")
+        self.assertEqual(ledger.get("C1").status, OrderStatus.CANCELED)  # type: ignore[union-attr]
+        ledger.mark_filled("C1")  # must be a no-op now
+        self.assertEqual(ledger.get("C1").status, OrderStatus.CANCELED)  # type: ignore[union-attr]
+
+    def test_position_apply_fill_rejects_invalid_side(self) -> None:
+        """apply_fill() with side=0 must raise ValueError."""
+        ledger = PositionLedger()
+        with self.assertRaises(ValueError):
+            ledger.apply_fill("9984", side=0, qty=100, price=100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

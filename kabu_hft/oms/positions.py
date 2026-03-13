@@ -22,6 +22,8 @@ class PositionLedger:
         return self._positions[symbol]
 
     def apply_fill(self, symbol: str, side: int, qty: int, price: float) -> PositionState:
+        if side not in (-1, 1):
+            raise ValueError(f"invalid side={side}: must be -1 (short) or +1 (long)")
         position = self._get(symbol)
         if qty <= 0:
             return position

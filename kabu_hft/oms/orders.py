@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger("kabu.oms")
 
 
 class OrderStatus(str, Enum):
@@ -46,6 +49,8 @@ class OrderLedger:
         self._records: dict[str, WorkingOrderRecord] = {}
 
     def add(self, record: WorkingOrderRecord) -> None:
+        if record.order_id in self._records:
+            logger.warning("duplicate order_id=%s — overwriting existing record", record.order_id)
         self._records[record.order_id] = record
 
     def get(self, order_id: str) -> WorkingOrderRecord | None:
@@ -89,12 +94,12 @@ class OrderLedger:
 
     def mark_rejected(self, order_id: str) -> None:
         record = self._records.get(order_id)
-        if record:
+        if record and not record.is_final:
             record.status = OrderStatus.REJECTED
 
     def mark_filled(self, order_id: str) -> None:
         record = self._records.get(order_id)
-        if record is None:
+        if record is None or record.is_final:
             return
         if record.cum_qty < record.qty:
             record.cum_qty = record.qty
