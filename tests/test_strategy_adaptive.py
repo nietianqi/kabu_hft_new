@@ -64,6 +64,72 @@ class StrategyAdaptiveTests(unittest.TestCase):
         strong = strategy._queue_threshold(snapshot, signal_strength=2.0)
         self.assertLessEqual(strong, weak)
 
+    def test_entry_filter_blocks_when_spread_below_take_profit_target(self) -> None:
+        app_cfg = load_config(None)
+        cfg = app_cfg.strategies[0]
+        cfg.tick_size = 1.0
+        cfg.take_profit_ticks = 1.0
+        strategy = HFTStrategy(
+            config=cfg,
+            order_profile=app_cfg.order_profile,
+            rest_client=DummyRestClient(),
+            dry_run=True,
+        )
+        snapshot = _snapshot(bid=100.0, ask=100.5)
+        allowed, reason = strategy._entry_filter(
+            snapshot=snapshot,
+            direction=1,
+            entry_price=100.0,
+            is_market=False,
+            fair_price=101.0,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "spread_below_take_profit_target")
+
+    def test_entry_filter_blocks_when_fair_cannot_cover_one_tick_target(self) -> None:
+        app_cfg = load_config(None)
+        cfg = app_cfg.strategies[0]
+        cfg.tick_size = 1.0
+        cfg.take_profit_ticks = 1.0
+        strategy = HFTStrategy(
+            config=cfg,
+            order_profile=app_cfg.order_profile,
+            rest_client=DummyRestClient(),
+            dry_run=True,
+        )
+        snapshot = _snapshot(bid=100.0, ask=101.0)
+        allowed, reason = strategy._entry_filter(
+            snapshot=snapshot,
+            direction=1,
+            entry_price=100.0,
+            is_market=False,
+            fair_price=100.4,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "fair_below_long_tp_target")
+
+    def test_entry_filter_allows_passive_long_when_one_tick_target_supported(self) -> None:
+        app_cfg = load_config(None)
+        cfg = app_cfg.strategies[0]
+        cfg.tick_size = 1.0
+        cfg.take_profit_ticks = 1.0
+        strategy = HFTStrategy(
+            config=cfg,
+            order_profile=app_cfg.order_profile,
+            rest_client=DummyRestClient(),
+            dry_run=True,
+        )
+        snapshot = _snapshot(bid=100.0, ask=101.0)
+        allowed, reason = strategy._entry_filter(
+            snapshot=snapshot,
+            direction=1,
+            entry_price=100.0,
+            is_market=False,
+            fair_price=101.2,
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "ok")
+
 
 class StrategyExitPolicyTests(unittest.IsolatedAsyncioTestCase):
     def _make_strategy(self) -> HFTStrategy:

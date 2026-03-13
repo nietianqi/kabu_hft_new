@@ -310,6 +310,36 @@ class HFTStrategy:
         if not allowed:
             return
 
+        quote_mode = self._mode_for_market(market_view.state)
+        queue_threshold = self._queue_threshold(snapshot, abs(score))
+        entry_decision = self.execution.preview_entry(
+            direction=direction,
+            snapshot=snapshot,
+            score=abs(score),
+            microprice=signal.microprice,
+            mode=quote_mode,
+            reservation_price=reservation_price,
+            queue_qty_threshold=queue_threshold,
+        )
+        open_allowed, open_reason = self._entry_filter(
+            snapshot=snapshot,
+            direction=direction,
+            entry_price=entry_decision.price,
+            is_market=entry_decision.is_market,
+            fair_price=fair_price,
+        )
+        if not open_allowed:
+            logger.debug(
+                "entry filtered symbol=%s reason=%s side=%+d spread=%.3f fair=%.3f entry=%.3f",
+                self.config.symbol,
+                open_reason,
+                direction,
+                snapshot.spread,
+                fair_price,
+                entry_decision.price,
+            )
+            return
+
         qty = self.risk.calc_qty(
             signal_strength=abs(score),
             mid=snapshot.mid,
@@ -318,8 +348,6 @@ class HFTStrategy:
         if qty <= 0:
             return
 
-        quote_mode = self._mode_for_market(market_view.state)
-        queue_threshold = self._queue_threshold(snapshot, abs(score))
         opened = await self.execution.open(
             direction=direction,
             qty=qty,
@@ -380,6 +408,38 @@ class HFTStrategy:
         if inv.side > 0:
             return inv.avg_price + target_ticks * tick
         return max(inv.avg_price - target_ticks * tick, tick)
+
+    def _entry_filter(
+        self,
+        *,
+        snapshot: BoardSnapshot,
+        direction: int,
+        entry_price: float,
+        is_market: bool,
+        fair_price: float,
+    ) -> tuple[bool, str]:
+        tick = max(self.config.tick_size, 1e-9)
+        target_ticks = max(self.config.take_profit_ticks, 0.0)
+        spread_ticks = snapshot.spread / tick if snapshot.spread > 0 else 0.0
+
+        if target_ticks > 0.0 and spread_ticks + 1e-9 < target_ticks:
+            return False, "spread_below_take_profit_target"
+        if is_market:
+            return False, "market_entry_rejected_for_scalp"
+
+        target_move = target_ticks * tick
+        if direction > 0:
+            if entry_price > snapshot.bid + 1e-9:
+                return False, "long_entry_chasing"
+            if target_ticks > 0.0 and fair_price + 1e-9 < entry_price + target_move:
+                return False, "fair_below_long_tp_target"
+            return True, "ok"
+
+        if entry_price < snapshot.ask - 1e-9:
+            return False, "short_entry_chasing"
+        if target_ticks > 0.0 and fair_price - 1e-9 > entry_price - target_move:
+            return False, "fair_above_short_tp_target"
+        return True, "ok"
 
     def _queue_threshold(self, snapshot: BoardSnapshot, signal_strength: float) -> int:
         base = max(self.config.queue_min_top_qty, 1)

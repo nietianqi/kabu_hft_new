@@ -284,7 +284,7 @@ class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
             profile=OrderProfile(mode="margin"),
         )
         self.assertEqual(captured["json_body"]["CashMargin"], 2)
-        self.assertEqual(captured["json_body"]["MarginTradeType"], 3)
+        self.assertEqual(captured["json_body"]["MarginTradeType"], OrderProfile().margin_trade_type)
 
     async def test_unknown_mode_is_rejected(self) -> None:
         client = KabuRestClient("http://localhost:18080")
