@@ -84,6 +84,14 @@ _MARGIN_MODES: frozenset[str] = frozenset(
 )
 
 _TSE_PLUS_RETRY_CODES: frozenset[int] = frozenset({100368, 100378})
+_ORDER_MUTATION_PATHS: frozenset[str] = frozenset(
+    {
+        "/kabusapi/sendorder",
+        "/kabusapi/sendorder/future",
+        "/kabusapi/sendorder/option",
+        "/kabusapi/cancelorder",
+    }
+)
 
 
 def _is_margin_mode(mode: str) -> bool:
@@ -758,7 +766,11 @@ class KabuRestClient:
                 if response.status < 400:
                     return payload
 
-                should_retry = response.status in {429, 500, 502, 503, 504}
+                # Avoid automatic retries for order-mutation APIs to reduce duplicate-order risk.
+                should_retry = (
+                    response.status in {429, 500, 502, 503, 504}
+                    and path not in _ORDER_MUTATION_PATHS
+                )
                 if should_retry and attempt < 2:
                     await asyncio.sleep(0.1 * (2**attempt))
                     continue

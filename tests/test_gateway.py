@@ -109,6 +109,75 @@ class GatewayAdapterTests(unittest.TestCase):
 
 
 class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_json_does_not_retry_order_mutation_500(self) -> None:
+        class _Response:
+            def __init__(self, status: int, payload: dict):
+                self.status = status
+                self._payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self) -> str:
+                return json.dumps(self._payload)
+
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, *_args, **_kwargs):
+                self.calls += 1
+                return _Response(500, {"Code": 500001, "Message": "temporary server error"})
+
+        client = KabuRestClient("http://localhost:18080")
+        client._token = "token"  # type: ignore[attr-defined]
+        client._session = _Session()  # type: ignore[attr-defined]
+
+        with self.assertRaises(KabuApiError):
+            await client._request_json("POST", "/kabusapi/sendorder", json_body={"Price": 100.0})
+
+        self.assertEqual(client._session.calls, 1)  # type: ignore[attr-defined]
+
+    async def test_request_json_retries_non_order_api(self) -> None:
+        class _Response:
+            def __init__(self, status: int, payload: dict):
+                self.status = status
+                self._payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self) -> str:
+                return json.dumps(self._payload)
+
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+                self.responses = [
+                    (500, {"Code": 500001}),
+                    (503, {"Code": 500002}),
+                    (200, {"ok": True}),
+                ]
+
+            def request(self, *_args, **_kwargs):
+                self.calls += 1
+                status, payload = self.responses[min(self.calls - 1, len(self.responses) - 1)]
+                return _Response(status, payload)
+
+        client = KabuRestClient("http://localhost:18080")
+        client._token = "token"  # type: ignore[attr-defined]
+        client._session = _Session()  # type: ignore[attr-defined]
+
+        result = await client._request_json("GET", "/kabusapi/orders", params={"product": 0})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(client._session.calls, 3)  # type: ignore[attr-defined]
+
     async def test_sendorder_uses_stored_password(self) -> None:
         captured: dict = {}
 
