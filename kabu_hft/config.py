@@ -51,6 +51,8 @@ DEFAULT_CONFIG: dict = {
         "max_hold_seconds": 45,
         "take_profit_ticks": 1.0,
         "take_profit_min_hold_ms": 300,
+        "entry_buffer_ticks": 0.25,
+        "max_trade_lag_ms_for_entry": 2500,
         "stop_loss_ticks": 1.5,
         "disable_stop_loss": False,
         "max_pending_ms": 2500,
@@ -207,6 +209,8 @@ class StrategyConfig:
     max_hold_seconds: int
     take_profit_ticks: float
     take_profit_min_hold_ms: int
+    entry_buffer_ticks: float
+    max_trade_lag_ms_for_entry: int
     stop_loss_ticks: float
     disable_stop_loss: bool
     max_pending_ms: int
@@ -294,6 +298,8 @@ def load_config(path: str | Path | None) -> AppConfig:
                 max_hold_seconds=int(merged.get("max_hold_seconds", 45)),
                 take_profit_ticks=float(merged.get("take_profit_ticks", 1.0)),
                 take_profit_min_hold_ms=int(merged.get("take_profit_min_hold_ms", 300)),
+                entry_buffer_ticks=float(merged.get("entry_buffer_ticks", 0.25)),
+                max_trade_lag_ms_for_entry=int(merged.get("max_trade_lag_ms_for_entry", 2500)),
                 stop_loss_ticks=float(merged.get("stop_loss_ticks", 1.5)),
                 disable_stop_loss=bool(merged.get("disable_stop_loss", False)),
                 max_pending_ms=int(merged.get("max_pending_ms", 2500)),

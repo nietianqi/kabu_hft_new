@@ -16,7 +16,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_dry_run_entry_and_exit_complete_round_trip(self) -> None:
         controller = ExecutionController(
             symbol="9984",
-            exchange=1,
+            exchange=27,
             rest_client=DummyRestClient(),
             order_profile=OrderProfile(),
             dry_run=True,
@@ -95,7 +95,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_defense_retreats_when_top_queue_is_thin(self) -> None:
         controller = ExecutionController(
             symbol="9984",
-            exchange=1,
+            exchange=27,
             rest_client=DummyRestClient(),
             order_profile=OrderProfile(),
             dry_run=True,
@@ -665,6 +665,153 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("kabu.execution", level="WARNING") as log_ctx:
             controller.reconcile_with_broker(broker_snapshot)
         self.assertTrue(any("reconciliation issue" in msg for msg in log_ctx.output))
+
+
+    async def test_code8_backoff_set_even_if_sync_throws(self) -> None:
+        """Backoff must be set before _sync_inventory_from_api so the loop stops."""
+
+        class Code8SyncFailsRestClient(DummyRestClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.exit_calls = 0
+
+            async def send_exit_order(self, **_kwargs) -> dict:
+                self.exit_calls += 1
+                raise KabuApiError(
+                    "POST /kabusapi/sendorder failed with status 500",
+                    status=500,
+                    payload={"Code": 8, "Message": "決済指定内容に誤りがあります"},
+                )
+
+            async def get_positions(self, symbol: str | None = None, product: int = 2) -> list[dict]:
+                raise RuntimeError("positions API unavailable")
+
+        rest = Code8SyncFailsRestClient()
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=27,
+            rest_client=rest,
+            order_profile=OrderProfile(mode="margin"),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+        controller.inventory.side = 1
+        controller.inventory.qty = 100
+        controller.inventory.avg_price = 100.0
+        controller.inventory.opened_ts_ns = 1
+
+        snapshot = BoardSnapshot(
+            symbol="9984",
+            exchange=27,
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=600,
+            ask_size=300,
+            last=100.5,
+            last_size=0,
+            volume=1_000,
+            vwap=100.5,
+            bids=(Level(100.0, 600),),
+            asks=(Level(101.0, 300),),
+            prev_board=None,
+        )
+
+        # First call: code=8 + sync throws. Backoff must STILL be set.
+        closed = await controller.close(snapshot=snapshot, score=-1.0, reason="test", force=False)
+        self.assertFalse(closed)
+        self.assertEqual(rest.exit_calls, 1)
+        # Backoff must have been set (non-zero) even though sync threw.
+        self.assertGreater(controller._exit_blocked_until_ns, 0)
+
+        # Second call: must be blocked immediately without touching the API.
+        closed2 = await controller.close(snapshot=snapshot, score=-1.0, reason="retry", force=False)
+        self.assertFalse(closed2)
+        self.assertEqual(rest.exit_calls, 1)  # no new exit attempt
+
+    async def test_entry_code4002004_treated_as_rejection(self) -> None:
+        """code=4002004 must back off and avoid immediate re-send loops."""
+
+        class Code4002004RestClient(DummyRestClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entry_calls = 0
+
+            async def send_entry_order(self, **_kwargs) -> dict:
+                self.entry_calls += 1
+                raise KabuApiError(
+                    "POST /kabusapi/sendorder failed with status 400",
+                    status=400,
+                    payload={"Code": 4002004, "Message": "トリガチェックエラー"},
+                )
+
+        rest = Code4002004RestClient()
+        controller = ExecutionController(
+            symbol="9984",
+            exchange=27,
+            rest_client=rest,
+            order_profile=OrderProfile(),
+            dry_run=False,
+            tick_size=1.0,
+            strong_threshold=0.8,
+            min_edge_ticks=0.1,
+            max_pending_ms=2_000,
+            min_order_lifetime_ms=100,
+            max_requotes_per_minute=20,
+            allow_aggressive_entry=False,
+            allow_aggressive_exit=True,
+            queue_model=False,
+        )
+
+        snapshot = BoardSnapshot(
+            symbol="9984",
+            exchange=27,
+            ts_ns=1,
+            bid=100.0,
+            ask=101.0,
+            bid_size=600,
+            ask_size=300,
+            last=100.5,
+            last_size=0,
+            volume=1_000,
+            vwap=100.5,
+            bids=(Level(100.0, 600),),
+            asks=(Level(101.0, 300),),
+            prev_board=None,
+        )
+
+        # Must return False (not raise) and stay FLAT.
+        opened = await controller.open(
+            direction=1,
+            qty=100,
+            snapshot=snapshot,
+            score=1.0,
+            microprice=100.5,
+            reason="test_4002004",
+        )
+        self.assertFalse(opened)
+        self.assertEqual(controller.state, ExecutionState.FLAT)
+        self.assertEqual(rest.entry_calls, 1)
+        self.assertGreater(controller.snapshot()["entry_blocked_until_ns"], 0)
+
+        opened_again = await controller.open(
+            direction=1,
+            qty=100,
+            snapshot=snapshot,
+            score=1.0,
+            microprice=100.5,
+            reason="test_4002004_retry",
+        )
+        self.assertFalse(opened_again)
+        self.assertEqual(rest.entry_calls, 1)
 
 
 if __name__ == "__main__":

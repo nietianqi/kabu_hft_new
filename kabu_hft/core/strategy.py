@@ -31,6 +31,8 @@ class HFTStrategy:
         self.config = config
         self.rest_client = rest_client
         self.dry_run = dry_run
+        self.entry_signal_threshold = max(config.entry_threshold, config.strong_threshold)
+        self.take_profit_min_hold_ns = max(config.take_profit_min_hold_ms, 0) * 1_000_000
         self.signals = SignalStack(
             obi_depth=config.obi_depth,
             obi_decay=config.obi_decay,
@@ -58,7 +60,7 @@ class HFTStrategy:
             stale_quote_ms=config.stale_quote_ms,
             tick_size=config.tick_size,
             allow_short=order_profile.allow_short,
-            entry_threshold=config.entry_threshold,
+            entry_threshold=self.entry_signal_threshold,
         )
         self.execution = ExecutionController(
             symbol=config.symbol,
@@ -291,6 +293,9 @@ class HFTStrategy:
             # New close policy:
             # 1) After entry fill, place a standing take-profit limit at +N ticks.
             # 2) Do not close solely because position is losing.
+            hold_ns = max(0, now_ns - self.execution.inventory.opened_ts_ns)
+            if hold_ns < self.take_profit_min_hold_ns:
+                return
             target_price = self._take_profit_price()
             if target_price > 0.0:
                 await self.execution.close(
@@ -300,6 +305,9 @@ class HFTStrategy:
                     force=False,
                     target_price=target_price,
                 )
+            return
+
+        if state is ExecutionState.FLAT and self.execution.has_external_inventory_conflict():
             return
 
         if score == 0.0:
@@ -333,6 +341,8 @@ class HFTStrategy:
             entry_price=entry_decision.price,
             is_market=entry_decision.is_market,
             fair_price=fair_price,
+            score=abs(score),
+            trade_lag_ms=market_view.trade_lag_ms,
         )
         if not open_allowed:
             logger.debug(
@@ -423,27 +433,38 @@ class HFTStrategy:
         entry_price: float,
         is_market: bool,
         fair_price: float,
+        score: float,
+        trade_lag_ms: float,
     ) -> tuple[bool, str]:
         tick = max(self.config.tick_size, 1e-9)
         target_ticks = max(self.config.take_profit_ticks, 0.0)
         spread_ticks = snapshot.spread / tick if snapshot.spread > 0 else 0.0
+        target_move = target_ticks * tick
+        fair_buffer = max(self.config.entry_buffer_ticks, 0.0) * tick
 
         if target_ticks > 0.0 and spread_ticks + 1e-9 < target_ticks:
             return False, "spread_below_take_profit_target"
         if is_market:
             return False, "market_entry_rejected_for_scalp"
+        if score + 1e-9 < self.entry_signal_threshold:
+            return False, "alpha_below_fast_scalp_threshold"
+        if self.config.max_trade_lag_ms_for_entry > 0 and trade_lag_ms > self.config.max_trade_lag_ms_for_entry:
+            return False, "trade_drought"
 
-        target_move = target_ticks * tick
         if direction > 0:
             if entry_price > snapshot.bid + 1e-9:
                 return False, "long_entry_chasing"
-            if target_ticks > 0.0 and fair_price + 1e-9 < entry_price + target_move:
+            if target_ticks > 0.0 and snapshot.ask + 1e-9 < entry_price + target_move:
+                return False, "book_cannot_pay_long_tp"
+            if target_ticks > 0.0 and fair_price + 1e-9 < entry_price + target_move + fair_buffer:
                 return False, "fair_below_long_tp_target"
             return True, "ok"
 
         if entry_price < snapshot.ask - 1e-9:
             return False, "short_entry_chasing"
-        if target_ticks > 0.0 and fair_price - 1e-9 > entry_price - target_move:
+        if target_ticks > 0.0 and snapshot.bid - 1e-9 > entry_price - target_move:
+            return False, "book_cannot_pay_short_tp"
+        if target_ticks > 0.0 and fair_price - 1e-9 > entry_price - target_move - fair_buffer:
             return False, "fair_above_short_tp_target"
         return True, "ok"
 
@@ -511,6 +532,11 @@ class HFTStrategy:
         interval = max(self.config.poll_interval_ms / 1000.0, 0.1)
         while self.started:
             await asyncio.sleep(interval)
+            try:
+                await self.execution.sync_broker_position()
+                self._drain_completed_trades()
+            except Exception as exc:
+                logger.warning("position sync error symbol=%s error=%s", self.config.symbol, exc)
             order_id = self.execution.current_order_id
             if not order_id:
                 continue

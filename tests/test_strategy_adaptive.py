@@ -82,6 +82,8 @@ class StrategyAdaptiveTests(unittest.TestCase):
             entry_price=100.0,
             is_market=False,
             fair_price=101.0,
+            score=1.0,
+            trade_lag_ms=0.0,
         )
         self.assertFalse(allowed)
         self.assertEqual(reason, "spread_below_take_profit_target")
@@ -104,11 +106,13 @@ class StrategyAdaptiveTests(unittest.TestCase):
             entry_price=100.0,
             is_market=False,
             fair_price=100.4,
+            score=1.0,
+            trade_lag_ms=0.0,
         )
         self.assertFalse(allowed)
         self.assertEqual(reason, "fair_below_long_tp_target")
 
-    def test_entry_filter_allows_passive_long_when_one_tick_target_supported(self) -> None:
+    def test_entry_filter_blocks_when_alpha_below_fast_scalp_threshold(self) -> None:
         app_cfg = load_config(None)
         cfg = app_cfg.strategies[0]
         cfg.tick_size = 1.0
@@ -125,7 +129,59 @@ class StrategyAdaptiveTests(unittest.TestCase):
             direction=1,
             entry_price=100.0,
             is_market=False,
-            fair_price=101.2,
+            fair_price=101.5,
+            score=0.50,
+            trade_lag_ms=0.0,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "alpha_below_fast_scalp_threshold")
+
+    def test_entry_filter_blocks_when_trade_drought_makes_exit_timing_unreliable(self) -> None:
+        app_cfg = load_config(None)
+        cfg = app_cfg.strategies[0]
+        cfg.tick_size = 1.0
+        cfg.take_profit_ticks = 1.0
+        cfg.max_trade_lag_ms_for_entry = 2500
+        strategy = HFTStrategy(
+            config=cfg,
+            order_profile=app_cfg.order_profile,
+            rest_client=DummyRestClient(),
+            dry_run=True,
+        )
+        snapshot = _snapshot(bid=100.0, ask=101.0)
+        allowed, reason = strategy._entry_filter(
+            snapshot=snapshot,
+            direction=1,
+            entry_price=100.0,
+            is_market=False,
+            fair_price=101.5,
+            score=1.0,
+            trade_lag_ms=3000.0,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "trade_drought")
+
+    def test_entry_filter_allows_passive_long_when_one_tick_target_supported(self) -> None:
+        app_cfg = load_config(None)
+        cfg = app_cfg.strategies[0]
+        cfg.tick_size = 1.0
+        cfg.take_profit_ticks = 1.0
+        cfg.entry_buffer_ticks = 0.25
+        strategy = HFTStrategy(
+            config=cfg,
+            order_profile=app_cfg.order_profile,
+            rest_client=DummyRestClient(),
+            dry_run=True,
+        )
+        snapshot = _snapshot(bid=100.0, ask=101.0)
+        allowed, reason = strategy._entry_filter(
+            snapshot=snapshot,
+            direction=1,
+            entry_price=100.0,
+            is_market=False,
+            fair_price=101.5,
+            score=1.0,
+            trade_lag_ms=0.0,
         )
         self.assertTrue(allowed)
         self.assertEqual(reason, "ok")
@@ -169,6 +225,19 @@ class StrategyExitPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["force"])
         self.assertEqual(kwargs["target_price"], 101.0)
 
+    async def test_take_profit_quote_waits_for_min_hold_time(self) -> None:
+        strategy = self._make_strategy()
+        strategy.config.take_profit_min_hold_ms = 500
+        strategy.take_profit_min_hold_ns = 500_000_000
+        self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_900_000_000)
+        strategy.execution.close = AsyncMock(return_value=True)
+        strategy.risk.must_close = lambda **_: (False, "")
+        snapshot = _snapshot(bid=100.0, ask=101.0, ts_ns=2_000_000_000)
+
+        await strategy._process_signal(snapshot, _signal(0.80), snapshot.ts_ns)
+
+        strategy.execution.close.assert_not_awaited()
+
     async def test_must_close_signal_is_ignored_while_losing(self) -> None:
         strategy = self._make_strategy()
         self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
@@ -197,6 +266,16 @@ class StrategyExitPolicyTests(unittest.IsolatedAsyncioTestCase):
         kwargs = strategy.execution.close.await_args.kwargs
         self.assertEqual(kwargs["reason"], "session_end")
         self.assertTrue(kwargs["force"])
+
+    async def test_external_inventory_conflict_blocks_new_entry(self) -> None:
+        strategy = self._make_strategy()
+        strategy.execution.open = AsyncMock(return_value=True)
+        strategy.execution.has_external_inventory = True
+        snapshot = _snapshot(bid=100.0, ask=101.0, ts_ns=2_000_000_000)
+
+        await strategy._process_signal(snapshot, _signal(0.80), snapshot.ts_ns)
+
+        strategy.execution.open.assert_not_awaited()
 
 
 if __name__ == "__main__":

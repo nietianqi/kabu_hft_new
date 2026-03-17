@@ -280,6 +280,7 @@ class ExecutionController:
         self.paper_order_counter = 0
         self.paper_last_fill_reason = ""
         self.has_stranded_partial: bool = False
+        self._entry_blocked_until_ns: int = 0
         self._exit_blocked_until_ns: int = 0
         self._last_position_sync_ns: int = 0
         self._position_sync_interval_ns: int = 1_000_000_000
@@ -354,7 +355,10 @@ class ExecutionController:
         reservation_price: float | None = None,
         queue_qty_threshold: int = 0,
     ) -> bool:
+        now_ns = self._clock.time_ns()
         if self.state is not ExecutionState.FLAT or qty <= 0:
+            return False
+        if now_ns < self._entry_blocked_until_ns:
             return False
 
         decision = self.preview_entry(
@@ -370,21 +374,34 @@ class ExecutionController:
             return False
 
         self.stats["open_attempts"] += 1
-        now_ns = self._clock.time_ns()
         if self.dry_run:
             order_id = self._next_paper_order_id()
         else:
             if self.rest_client is None:
                 raise RuntimeError("rest_client is required for live trading (dry_run=False)")
-            response = await self.rest_client.send_entry_order(
-                symbol=self.symbol,
-                exchange=self.exchange,
-                side=direction,
-                qty=qty,
-                price=decision.price,
-                is_market=decision.is_market,
-                profile=self.order_profile,
-            )
+            try:
+                response = await self.rest_client.send_entry_order(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    side=direction,
+                    qty=qty,
+                    price=decision.price,
+                    is_market=decision.is_market,
+                    profile=self.order_profile,
+                )
+            except KabuApiError as exc:
+                error_code = _extract_error_code(exc.payload)
+                if error_code == 4002004:
+                    self._entry_blocked_until_ns = max(self._entry_blocked_until_ns, now_ns + 15_000_000_000)
+                    # Trigger-check error: FrontOrderType / price mismatch for this session.
+                    # Treat as a non-fatal rejection, but back off to avoid hammering sendorder.
+                    logger.warning(
+                        "entry rejected symbol=%s code=4002004 (trigger check error); "
+                        "backing off 15s; check FrontOrderType or price tick alignment",
+                        self.symbol,
+                    )
+                    return False
+                raise
             order_id = str(response.get("OrderId") or response.get("ID") or "")
             if not order_id:
                 logger.warning("entry rejected for %s: %s", self.symbol, response)
@@ -485,13 +502,18 @@ class ExecutionController:
                     return False
                 error_code = _extract_error_code(exc.payload)
                 if error_code == 8:
-                    await self._sync_inventory_from_api()
-                    self._exit_blocked_until_ns = now_ns + 15_000_000_000  # 15s
+                    # Set backoff FIRST so the loop stops even if _sync_inventory_from_api raises.
+                    _code8_blocked_until = now_ns + 15_000_000_000  # 15s
+                    self._exit_blocked_until_ns = _code8_blocked_until
                     logger.warning(
                         "exit rejected symbol=%s code=8 (locked lot / margin spec error); "
                         "backing off 15s — check for pending manual orders",
                         self.symbol,
                     )
+                    await self._sync_inventory_from_api()
+                    # sync_broker_position may clear _exit_blocked_until_ns when inventory
+                    # looks clean; re-apply the code=8 backoff so we don't retry immediately.
+                    self._exit_blocked_until_ns = max(self._exit_blocked_until_ns, _code8_blocked_until)
                     return False
                 raise
             order_id = str(response.get("OrderId") or response.get("ID") or "")
@@ -691,6 +713,8 @@ class ExecutionController:
             "broker_closable_qty": self.broker_closable_qty,
             "manual_close_lock": self._manual_close_lock,
             "external_inventory": self.has_external_inventory,
+            "entry_blocked_until_ns": self._entry_blocked_until_ns,
+            "exit_blocked_until_ns": self._exit_blocked_until_ns,
             "working_order_id": self.current_order_id,
             "working_order_side": self.working_order.side if self.working_order else 0,
             "working_order_price": self.working_order.price if self.working_order else 0.0,
@@ -920,39 +944,6 @@ class ExecutionController:
 
     async def _sync_inventory_from_api(self) -> None:
         await self.sync_broker_position(force=True)
-        return
-        """从 broker 实际持仓中重新同步 inventory.qty。
-        在 close() 抛出 KabuApiError('not enough inventory') 时调用，
-        消除本地状态与 broker 端的偏差，防止无限循环。
-        """
-        if self.rest_client is None:
-            logger.error("_sync_inventory_from_api: rest_client is None, cannot sync")
-            return
-        try:
-            positions = await self.rest_client.get_positions(self.symbol)
-        except Exception as exc:
-            logger.error("_sync_inventory_from_api: get_positions failed: %s", exc)
-            return
-
-        # kabu API: Side='2' → 买建（多头，内部 side=+1）
-        #           Side='1' → 卖建（空头，内部 side=-1）
-        api_side_str = "2" if self.inventory.side == 1 else "1"
-        available = sum(
-            int(p.get("HoldQty") or 0)
-            for p in positions
-            if str(p.get("Symbol")) == str(self.symbol)
-            and str(p.get("Side")) == api_side_str
-        )
-        old_qty = self.inventory.qty
-        self.inventory.qty = available
-        logger.warning(
-            "inventory synced from API symbol=%s qty %d → %d (broker HoldQty)",
-            self.symbol,
-            old_qty,
-            available,
-        )
-        if available == 0:
-            self._reset_inventory()
 
     def _reset_inventory(self) -> None:
         self.inventory = Inventory()
