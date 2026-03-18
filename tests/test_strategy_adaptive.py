@@ -277,6 +277,67 @@ class StrategyExitPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         strategy.execution.open.assert_not_awaited()
 
+    async def test_spread_blowout_within_confirm_window_does_not_close(self) -> None:
+        """P0: single tick of wide spread must NOT force-close within the confirm window."""
+        strategy = self._make_strategy()
+        strategy.config.spread_blowout_confirm_ms = 500
+        self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
+        strategy.execution.close = AsyncMock(return_value=True)
+
+        # spread = ask - bid = 107 - 100 = 7 ticks (> abnormal_max_spread_ticks=6)
+        now_ns = 10_000_000_000
+        snap = _snapshot(bid=100.0, ask=107.0, ts_ns=now_ns)
+
+        await strategy._process_signal(snap, _signal(0.10), now_ns)
+
+        strategy.execution.close.assert_not_awaited()
+        # confirm timer should have been started
+        self.assertGreater(strategy._spread_blowout_since_ns, 0)
+
+    async def test_spread_blowout_after_confirm_window_triggers_close(self) -> None:
+        """P0: after confirm window expires the position must be force-closed."""
+        strategy = self._make_strategy()
+        strategy.config.spread_blowout_confirm_ms = 500
+        self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=1_000_000_000)
+        strategy.execution.close = AsyncMock(return_value=True)
+
+        T = 10_000_000_000
+        snap1 = _snapshot(bid=100.0, ask=107.0, ts_ns=T)
+        snap2 = _snapshot(bid=100.0, ask=107.0, ts_ns=T + 600_000_000)  # 600ms later > 500ms
+
+        # First tick: sets the timer, does NOT close
+        await strategy._process_signal(snap1, _signal(0.10), T)
+        strategy.execution.close.assert_not_awaited()
+
+        # Second tick: confirm window expired → must close
+        await strategy._process_signal(snap2, _signal(0.10), T + 600_000_000)
+        strategy.execution.close.assert_awaited_once()
+        kwargs = strategy.execution.close.await_args.kwargs
+        self.assertEqual(kwargs["reason"], "abnormal_spread_blowout")
+        self.assertTrue(kwargs["force"])
+
+    async def test_max_hold_hard_cap_closes_underwater_position(self) -> None:
+        """P1: hard-cap forces close even when pnl_ticks < 0 after mult × max_hold."""
+        strategy = self._make_strategy()
+        strategy.config.max_hold_seconds = 45
+        strategy.config.max_hold_hard_mult = 3      # hard cap = 135s
+        # Position opened 136 seconds ago — past the 135s hard cap
+        now_ns = 200_000_000_000
+        opened_ts_ns = now_ns - 136_000_000_000
+        self._set_long_inventory(strategy, avg_price=100.0, qty=100, opened_ts_ns=opened_ts_ns)
+        strategy.execution.close = AsyncMock(return_value=True)
+        # Simulate: must_close returns True but position is underwater (pnl_ticks < 0)
+        strategy.risk.must_close = lambda **_: (True, "max_hold_time")
+        # bid=98 < entry=100 → pnl_ticks = -2 → normal must_close gate blocks
+        snap = _snapshot(bid=98.0, ask=99.0, ts_ns=now_ns - 500_000_000)
+
+        await strategy._process_signal(snap, _signal(0.10), now_ns)
+
+        strategy.execution.close.assert_awaited_once()
+        kwargs = strategy.execution.close.await_args.kwargs
+        self.assertEqual(kwargs["reason"], "max_hold_hard_cap")
+        self.assertTrue(kwargs["force"])
+
 
 if __name__ == "__main__":
     unittest.main()

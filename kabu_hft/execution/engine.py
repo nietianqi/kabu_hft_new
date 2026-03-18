@@ -856,7 +856,11 @@ class ExecutionController:
         try:
             positions = await self.rest_client.get_positions(self.symbol)
         except Exception as exc:
-            logger.error("sync_broker_position: get_positions failed: %s", exc)
+            logger.error(
+                "sync_broker_position: get_positions failed: type=%s repr=%s",
+                type(exc).__name__,
+                repr(exc),
+            )
             return
 
         long_hold, long_closable = self._position_side_totals(positions, symbol=self.symbol, side="2")

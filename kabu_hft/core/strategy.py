@@ -33,6 +33,7 @@ class HFTStrategy:
         self.dry_run = dry_run
         self.entry_signal_threshold = max(config.entry_threshold, config.strong_threshold)
         self.take_profit_min_hold_ns = max(config.take_profit_min_hold_ms, 0) * 1_000_000
+        self._spread_blowout_since_ns: int = 0
         self.signals = SignalStack(
             obi_depth=config.obi_depth,
             obi_decay=config.obi_decay,
@@ -216,10 +217,21 @@ class HFTStrategy:
         if state is not ExecutionState.OPENING:
             self._pending_entry_alpha = 0.0
 
+        # P0: reset spread-blowout confirmation timer when spread is normal
+        if market_view.state is not MarketState.ABNORMAL or market_view.reason != "spread_blowout":
+            self._spread_blowout_since_ns = 0
+
         if market_view.state is MarketState.ABNORMAL:
             if state is ExecutionState.OPENING and self.execution.working_age_ns(now_ns) > self.execution.min_order_lifetime_ns:
                 await self.execution.cancel_working(reason=f"abnormal_{market_view.reason}")
             elif state is ExecutionState.OPEN:
+                # P0: require spread_blowout_confirm_ms of sustained wide spread before force-closing
+                confirm_ns = self.config.spread_blowout_confirm_ms * 1_000_000
+                if market_view.reason == "spread_blowout" and confirm_ns > 0:
+                    if self._spread_blowout_since_ns == 0:
+                        self._spread_blowout_since_ns = now_ns
+                    if now_ns - self._spread_blowout_since_ns < confirm_ns:
+                        return  # inside confirmation window: cancel entry but hold position
                 await self.execution.close(
                     snapshot=snapshot,
                     score=score,
@@ -286,6 +298,20 @@ class HFTStrategy:
                     snapshot=snapshot,
                     score=score,
                     reason=reason or "risk_close",
+                    force=True,
+                )
+                return
+
+            # P1: hard-cap — force close even when underwater after max_hold * max_hold_hard_mult
+            hard_cap_ns = (
+                self.config.max_hold_seconds * 1_000_000_000 * self.config.max_hold_hard_mult
+            )
+            hold_elapsed_ns = max(0, now_ns - self.execution.inventory.opened_ts_ns)
+            if hard_cap_ns > 0 and hold_elapsed_ns >= hard_cap_ns:
+                await self.execution.close(
+                    snapshot=snapshot,
+                    score=score,
+                    reason="max_hold_hard_cap",
                     force=True,
                 )
                 return

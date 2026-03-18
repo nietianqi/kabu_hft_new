@@ -49,6 +49,8 @@ DEFAULT_CONFIG: dict = {
         "zscore_window": 300,
         "mp_ema_alpha": 0.10,
         "max_hold_seconds": 45,
+        "max_hold_hard_mult": 3,
+        "spread_blowout_confirm_ms": 400,
         "take_profit_ticks": 1.0,
         "take_profit_min_hold_ms": 300,
         "entry_buffer_ticks": 0.25,
@@ -207,6 +209,8 @@ class StrategyConfig:
     zscore_window: int
     mp_ema_alpha: float
     max_hold_seconds: int
+    max_hold_hard_mult: int
+    spread_blowout_confirm_ms: int
     take_profit_ticks: float
     take_profit_min_hold_ms: int
     entry_buffer_ticks: float
@@ -296,6 +300,8 @@ def load_config(path: str | Path | None) -> AppConfig:
                 zscore_window=int(merged.get("zscore_window", 300)),
                 mp_ema_alpha=float(merged.get("mp_ema_alpha", 0.10)),
                 max_hold_seconds=int(merged.get("max_hold_seconds", 45)),
+                max_hold_hard_mult=int(merged.get("max_hold_hard_mult", 3)),
+                spread_blowout_confirm_ms=int(merged.get("spread_blowout_confirm_ms", 400)),
                 take_profit_ticks=float(merged.get("take_profit_ticks", 1.0)),
                 take_profit_min_hold_ms=int(merged.get("take_profit_min_hold_ms", 300)),
                 entry_buffer_ticks=float(merged.get("entry_buffer_ticks", 0.25)),
